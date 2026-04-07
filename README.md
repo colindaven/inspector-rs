@@ -1,9 +1,22 @@
 ## Inspector Rust Conversion - Implementation Status
 
-**Last Updated:** April 7, 2026, 16:00 UTC  
-**Status:** Phases 1-8 COMPLETE + Parallelized minimap2 + File Logging + long_read_QV  
-**Binary:** `/mnt/beegfs/scratch/bioinformatics/colin/dev/inspector-rust/target/release/inspector` (3.3 MB)  
-**Test Results:** 26/26 ✅ | Compilation: ✅ | File Logging + QV Rename: ✅
+
+# Aim - test if a partial rewrite of the python tool Inspector is possible with Claude AI in Rust
+- Inspector repo - https://github.com/Maggi-Chen/Inspector - **Cite and use this true Inspector repo**
+- Goal is to improve read mapping and analysis performance.
+
+
+# Status - alpha, unfinished
+- **Do not use** !
+- Evaluation subpart partially complete - but not all outputs are produced yet.
+- No correction, no plotting
+
+
+# Claude status and details
+- **Last Updated:** April 7, 2026, 16:00 UTC  
+- **Status:** Phases 1-8 COMPLETE + Parallelized minimap2 + File Logging + long_read_QV  
+- **Binary:** `/mnt/beegfs/scratch/bioinformatics/colin/dev/inspector-rust/target/release/inspector` (3.3 MB)  
+- **Test Results:** 26/26 ✅ | Compilation: ✅ | File Logging + QV Rename: ✅
 
 ---
 
@@ -20,12 +33,12 @@
     - Used for reporting at each stage
   
 - [x] **Concurrent minimap2 + samtools pipeline** (src/pipeline/evaluate.rs)
-  - Each FASTQ is split into 8 parts
-  - 8 minimap2 subprocesses run in parallel via rayon (each on one part)
+  - Each FASTQ is split into 4 parts
+  - 4 minimap2 subprocesses run in parallel via rayon (each on one part)
   - Each minimap2 output piped to samtools sort (sorted BAM per part)
-  - All 8 BAMs from one FASTQ are merged into single BAM
+  - All 4 BAMs from one FASTQ are merged into single BAM
   - Final merge and index step produces read_to_contig.bam
-  - **Performance:** ~8x faster for read mapping at full thread utilization (threads divided equally among parts)
+  - **Performance:** ~4x faster for read mapping at full thread utilization (threads divided equally among parts)
   - Thread allocation: `config.thread / 8` per subprocess (capped at minimum 1)
 
 - [x] **Comprehensive read mapping logging and statistics**
@@ -82,11 +95,11 @@
 ```rust
 // In map_reads():
 - For each read file:
-  1. Split into 8 gzipped FASTQ parts via utils::split_fastq_gz()
+  1. Split into 4 gzipped FASTQ parts via utils::split_fastq_gz()
   2. Create split_workspace_read_N/ directory
-  3. Map all 8 parts in parallel:
+  3. Map all 4 parts in parallel:
      minimap2 -> samtools sort -> part_NN.bam
-  4. Merge 8 BAMs -> read_to_contig_N.bam (one per input file)
+  4. Merge 4 BAMs -> read_to_contig_N.bam (one per input file)
   5. Clean up split workspace and parts
 
 - After all read files:
