@@ -1,4 +1,7 @@
+
 # Inspector (Rust rewrite)
+
+# Status Unfinished alpha - results incomplete and vary widely from the original - do not use
 
 Inspector is a reference-free long-read assembly evaluator and error-correction tool.
 
