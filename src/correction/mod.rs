@@ -6,8 +6,8 @@ use anyhow::Result;
 /// Correct small-scale base errors
 pub fn base_correction(
     ctg_seq: &str,
-    snp_set: &[(u64, String)],
-    ctg: &str,
+    _snp_set: &[(u64, String)],
+    _ctg: &str,
 ) -> Result<String> {
     // Placeholder
     Ok(ctg_seq.to_string())
@@ -15,13 +15,13 @@ pub fn base_correction(
 
 /// Find positions for Flye re-assembly
 pub fn find_positions(
-    ae_set: &[(u64, u64)],
-    snp_set: &[(u64, String)],
-    bam_file: &str,
-    outpath: &str,
-    datatype: &str,
-    thread: usize,
-    timeout: u64,
+    _ae_set: &[(u64, u64)],
+    _snp_set: &[(u64, String)],
+    _bam_file: &str,
+    _outpath: &str,
+    _datatype: &str,
+    _thread: usize,
+    _timeout: u64,
 ) -> Result<()> {
     // Placeholder
     Ok(())
@@ -30,8 +30,8 @@ pub fn find_positions(
 /// Apply structural error corrections
 pub fn ae_correction(
     ctg_seq: &str,
-    ae_set: &[(u64, u64)],
-    outpath: &str,
+    _ae_set: &[(u64, u64)],
+    _outpath: &str,
 ) -> Result<String> {
     // Placeholder
     Ok(ctg_seq.to_string())

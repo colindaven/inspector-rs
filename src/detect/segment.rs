@@ -87,10 +87,13 @@ fn detect_insertion_deletion(
     if ref_gap > overlap_window && ref_gap < window_max as i64 && query_gap > 100 {
         let insert_size = query_gap;
         if insert_size >= min_size as i64 && insert_size <= max_size as i64 {
+            // 7-field format: chrom pos size type readname flag_sum avg_mapq
             let sv_line = format!(
-                "{}\t{}\t{}\tINS-segment\t{}\t{}",
+                "{}\t{}\t{}\tINS-segment\t{}\t{}\t{}",
                 left.rname, left.refend, insert_size,
-                left.query_name, (left.mapq as u32 + right.mapq as u32) / 2
+                left.query_name,
+                left.flag as u32 + right.flag as u32,
+                (left.mapq as u32 + right.mapq as u32) / 2
             );
             sv_calls.push(sv_line);
             return;
@@ -103,9 +106,11 @@ fn detect_insertion_deletion(
         let delete_size = ref_gap - query_gap;
         if delete_size >= min_size as i64 && delete_size <= max_size as i64 {
             let sv_line = format!(
-                "{}\t{}\t{}\tDEL-segment\t{}\t{}",
+                "{}\t{}\t{}\tDEL-segment\t{}\t{}\t{}",
                 left.rname, left.refend, delete_size,
-                left.query_name, (left.mapq as u32 + right.mapq as u32) / 2
+                left.query_name,
+                left.flag as u32 + right.flag as u32,
+                (left.mapq as u32 + right.mapq as u32) / 2
             );
             sv_calls.push(sv_line);
         }
@@ -135,9 +140,11 @@ fn detect_inversion(
     let inv_size = (right.pos as i64 - left.refend as i64) as usize;
     if inv_size >= min_size && inv_size <= max_size {
         let sv_line = format!(
-            "{}\t{}\t{}\tINV-segment\t{}\t{}",
+            "{}\t{}\t{}\tINV-segment\t{}\t{}\t{}",
             left.rname, left.refend, inv_size,
-            left.query_name, (left.mapq as u32 + right.mapq as u32) / 2
+            left.query_name,
+            left.flag as u32 + right.flag as u32,
+            (left.mapq as u32 + right.mapq as u32) / 2
         );
         sv_calls.push(sv_line);
     }
@@ -147,7 +154,7 @@ fn detect_inversion(
 fn detect_translocation(
     left: &ReadSegment,
     _right: &ReadSegment,
-    sv_calls: &mut Vec<String>,
+    _sv_calls: &mut Vec<String>,
 ) {
     // Placeholder: translocations require more complex handling
     // involving inter-chromosomal alignment patterns
@@ -192,5 +199,10 @@ mod tests {
         // delete_size = 200 - 0 = 200 >= 50 -> should detect
         assert!(!svs.is_empty(), "Expected deletion of 200bp, got {:?}", svs);
         assert!(svs[0].contains("DEL-segment"), "Expected DEL-segment call");
+            // Verify 7-field format: chrom\tpos\tsize\ttype\treadname\tflag_sum\tavg_mapq
+            let fields: Vec<&str> = svs[0].split('\t').collect();
+            assert_eq!(fields.len(), 7, "Expected 7 tab-delimited fields in debreak.temp format, got {}: {:?}", fields.len(), svs[0]);
+            assert_eq!(fields[5], "0",  "Field[5] should be flag sum (0+0=0)");
+            assert_eq!(fields[6], "20", "Field[6] should be avg mapq (20+20)/2=20");
     }
 }

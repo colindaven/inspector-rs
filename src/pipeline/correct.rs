@@ -482,7 +482,7 @@ fn complement_base(base: char) -> char {
 /// Execute Flye for local re-assembly of error regions
 fn execute_flye_correction(
     input_dir: &str,
-    assembly: &str,
+    _assembly: &str,
     reads: &[String],
     contig_name: &str,
     datatype: &str,

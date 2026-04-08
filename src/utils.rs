@@ -44,17 +44,34 @@ pub fn ensure_output_dir(path: &str) -> Result<()> {
 }
 
 /// Check if an external tool is available in PATH
-pub fn require_tool(tool: &str) -> Result<()> {
-    std::process::Command::new(tool)
+pub fn require_tool(tool: &str) -> Result<String> {
+    let output = std::process::Command::new(tool)
         .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .output()
         .map_err(|_| anyhow::anyhow!(
             "Required tool '{}' not found in PATH. Please install it and ensure it is on your PATH.",
             tool
         ))?;
-    Ok(())
+    // Version strings are often on stdout; some tools (e.g. samtools) print to stderr
+    let version_line = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let version_line = if version_line.is_empty() {
+        String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or("unknown version")
+            .trim()
+            .to_string()
+    } else {
+        version_line
+    };
+    Ok(version_line)
 }
 
 /// Custom writer that writes to both stdout and a file
@@ -235,6 +252,106 @@ pub fn get_fastq_stats(fastq_path: &str) -> Result<FastqStats> {
     }
 
     Ok(stats)
+}
+
+/// Run seqkit stats on a FASTQ file and return read count and total bases.
+/// Much faster than reading all records in Rust for large files.
+pub fn seqkit_stats(fastq_path: &str) -> Result<FastqStats> {
+    let output = std::process::Command::new("seqkit")
+        .arg("stats")
+        .arg("-j")
+        .arg("8")  // use multiple threads for speed
+        .arg("-T")   // tab-delimited output
+        .arg(fastq_path)
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run seqkit stats on '{}': {}", fastq_path, e))?;
+
+    if !output.status.success() {
+        anyhow::bail!(
+            "seqkit stats failed on '{}': {}",
+            fastq_path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    // Tab-delimited columns: file  format  type  num_seqs  sum_len  min_len  avg_len  max_len
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines().skip(1) {  // skip header
+        let fields: Vec<&str> = line.split('\t').collect();
+        if fields.len() >= 5 {
+            let reads = fields[3].trim().parse::<usize>().unwrap_or(0);
+            let bases = fields[4].trim().parse::<u64>().unwrap_or(0);
+            return Ok(FastqStats { reads, bases });
+        }
+    }
+
+    anyhow::bail!("Could not parse seqkit stats output for '{}'", fastq_path)
+}
+
+/// Split a FASTQ file into num_parts parts using seqkit split2.
+/// Returns sorted list of output file paths.
+pub fn seqkit_split2(input_path: &str, outdir: &str, num_parts: usize) -> Result<Vec<String>> {
+    let status = std::process::Command::new("seqkit")
+        .arg("split2")
+        .arg("-p")
+        .arg(num_parts.to_string())
+        .arg("-O")
+        .arg(outdir)
+        .arg("-f")   // force overwrite existing files
+        .arg(input_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run seqkit split2 on '{}': {}", input_path, e))?;
+
+    if !status.success() {
+        anyhow::bail!("seqkit split2 failed on '{}'", input_path);
+    }
+
+    // seqkit names outputs <basename>.part_NNN.<ext> placed in outdir
+    let mut paths: Vec<String> = fs::read_dir(outdir)
+        .map_err(|e| anyhow::anyhow!("Cannot list split output dir '{}': {}", outdir, e))?
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let name = path.file_name()?.to_str()?.to_string();
+            if name.contains(".part_") && (name.ends_with(".fastq.gz") || name.ends_with(".fq.gz")) {
+                Some(path.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    paths.sort();
+
+    if paths.is_empty() {
+        anyhow::bail!(
+            "seqkit split2 produced no output files in '{}' for input '{}'",
+            outdir, input_path
+        );
+    }
+
+    Ok(paths)
+}
+
+/// Subsample a FASTQ file to retain approximately `fraction` of reads using seqkit sample.
+pub fn seqkit_sample(input_path: &str, output_path: &str, fraction: f64) -> Result<()> {
+    let status = std::process::Command::new("seqkit")
+        .arg("sample")
+        .arg("-p")
+        .arg(format!("{:.6}", fraction))
+        .arg("-s")   // fixed seed for reproducibility
+        .arg("42")
+        .arg("-o")
+        .arg(output_path)
+        .arg(input_path)
+        .status()
+        .map_err(|e| anyhow::anyhow!("Failed to run seqkit sample on '{}': {}", input_path, e))?;
+
+    if !status.success() {
+        anyhow::bail!("seqkit sample failed on '{}'", input_path);
+    }
+
+    Ok(())
 }
 
 /// Split a gzipped FASTQ file into N parts and write to separate gzipped files.

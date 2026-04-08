@@ -18,9 +18,9 @@ pub fn simple_fasta(
     min_size_assembly_error: usize,
 ) -> Result<FastaStats> {
     info!("Loading FASTA files");
-    
+
     let mut all_contigs = Vec::new();
-    
+
     // Load all input FASTA files
     for file_path in contig_files {
         let records = fasta::load_fasta(file_path)?;
@@ -91,18 +91,26 @@ pub fn simple_fasta(
     writeln!(summary, "Total contig length\t{}", stats.total_length)?;
     writeln!(summary, "Longest contig\t{}", stats.largest_contig_length)?;
     writeln!(summary, "N50\t{}", stats.n50)?;
-    writeln!(summary, "N50 (large contigs)\t{}", 
+    writeln!(
+        summary,
+        "N50 (large contigs)\t{}",
         utils::compute_n50(
-            stats.chromosomes_large.iter()
+            stats
+                .chromosomes_large
+                .iter()
                 .filter_map(|c| stats.contig_lengths.get(c).copied())
-                .collect()
+                .collect(),
         )
     )?;
 
     info!("Contigs: {}", stats.chromosomes.len());
     info!("Total length: {}", utils::format_size(stats.total_length));
     info!("N50: {}", utils::format_size(stats.n50));
-    info!("Large contigs (≥{}bp): {}", min_size_assembly_error, stats.chromosomes_large.len());
+    info!(
+        "Large contigs (≥{}bp): {}",
+        min_size_assembly_error,
+        stats.chromosomes_large.len()
+    );
 
     Ok(stats)
 }
@@ -113,44 +121,164 @@ pub fn mapping_info_contig(
     large_chroms: &[String],
     small_chroms: &[String],
     total_length: u64,
-    total_length_large: u64,
+    _total_length_large: u64,
 ) -> Result<usize> {
-    // Returns average coverage
-    // TODO: Implement coverage calculation from depth files
-    Ok(20)
+    // Read depth files written by detect_sortbam / detect_sortbam_nosv.
+    // Each file contains: chrom \t reads \t total_mapped_bp
+    // Coverage for a contig = total_mapped_bp / contig_length.
+    // We compute genome-wide average as sum(total_mapped_bp) / total_length.
+    use std::io::BufRead;
+
+    let all_chroms: Vec<&str> = large_chroms.iter().chain(small_chroms.iter()).map(|s| s.as_str()).collect();
+    let mut total_mapped_bp: u64 = 0;
+
+    for chrom in all_chroms {
+        let depth_file = format!("{}map_depth/read_to_contig_{}.depth", outpath, chrom);
+        if let Ok(f) = File::open(&depth_file) {
+            for line in std::io::BufReader::new(f).lines().flatten() {
+                let parts: Vec<&str> = line.split('\t').collect();
+                if parts.len() >= 3 {
+                    if let Ok(bp) = parts[2].parse::<u64>() {
+                        total_mapped_bp += bp;
+                    }
+                }
+            }
+        }
+    }
+
+    if total_length == 0 || total_mapped_bp == 0 {
+        info!("Coverage files not found or empty; defaulting to coverage=20");
+        return Ok(20);
+    }
+
+    let coverage = (total_mapped_bp / total_length) as usize;
+    // Guard against pathologically low or high values
+    let coverage = coverage.max(1);
+    Ok(coverage)
 }
 
-/// Merge and report assembly errors from clustering
+/// Helper: collect all lines from per-chrom merged files matching `prefix`.
+fn collect_merged(outpath: &str, prefix: &str) -> Vec<String> {
+    use std::io::BufRead;
+    let dir = format!("{}ae_merge_workspace/", outpath);
+    let mut lines = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return lines;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with(prefix) {
+                if let Ok(f) = File::open(&path) {
+                    let reader = std::io::BufReader::new(f);
+                    for l in reader.lines().flatten() {
+                        if !l.is_empty() {
+                            lines.push(l);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    lines
+}
+
+/// Merge and report assembly errors from clustering.
+/// Mirrors Python denovo_static.assembly_info_cluster().
 pub fn assembly_info_cluster(
     outpath: &str,
     min_size: usize,
     max_size: usize,
 ) -> Result<()> {
-    // Placeholder
+    let bed_path = format!("{}assembly_errors.bed", outpath);
+    let mut bed = File::create(&bed_path)?;
+
+    let parse = |line: &str| -> Option<(String, u64, u64, String, String)> {
+        let f: Vec<&str> = line.split('\t').collect();
+        if f.len() < 8 {
+            return None;
+        }
+        let pos: u64 = f[1].parse().ok()?;
+        let size: u64 = f[2].parse().ok()?;
+        if (size as usize) < min_size || (size as usize) > max_size {
+            return None;
+        }
+        Some((f[0].to_string(), pos, size, f[3].to_string(), f[7].to_string()))
+    };
+
+    let mut n_exp = 0usize;
+    let mut n_col = 0usize;
+    let mut n_inv = 0usize;
+
+    for line in collect_merged(outpath, "del_merged_") {
+        if let Some((chrom, pos, size, count, readnames)) = parse(&line) {
+            writeln!(
+                bed,
+                "{}\t{}\t{}\t{}\tExpansion\tSize={}\t{}",
+                chrom,
+                pos,
+                pos + size,
+                count,
+                size,
+                readnames
+            )?;
+            n_exp += 1;
+        }
+    }
+
+    for line in collect_merged(outpath, "ins_merged_") {
+        if let Some((chrom, pos, size, count, readnames)) = parse(&line) {
+            writeln!(
+                bed,
+                "{}\t{}\t{}\t{}\tCollapse\tSize={}\t{}",
+                chrom,
+                pos,
+                pos + 1,
+                count,
+                size,
+                readnames
+            )?;
+            n_col += 1;
+        }
+    }
+
+    for line in collect_merged(outpath, "inv_merged_") {
+        if let Some((chrom, pos, size, count, readnames)) = parse(&line) {
+            writeln!(
+                bed,
+                "{}\t{}\t{}\t{}\tInversion\t{}",
+                chrom,
+                pos,
+                pos + size,
+                count,
+                readnames
+            )?;
+            n_inv += 1;
+        }
+    }
+
+    info!(
+        "assembly_errors.bed: {} Expansions, {} Collapses, {} Inversions",
+        n_exp, n_col, n_inv
+    );
+
     Ok(())
 }
 
 /// Reference-based assembly error reporting
-pub fn assembly_info_ref(outpath: &str) -> Result<()> {
-    // Placeholder
+pub fn assembly_info_ref(_outpath: &str) -> Result<()> {
     Ok(())
 }
 
 /// Get reference alignment info and coverage
-pub fn get_ref_align_info(
-    path: &str,
-    total_length: u64,
-) -> Result<()> {
-    // Placeholder
+pub fn get_ref_align_info(_path: &str, _total_length: u64) -> Result<()> {
     Ok(())
 }
 
 /// Count base-pair errors from reference alignment
-pub fn basepair_error_ref(
-    outpath: &str,
-    largest_chr: &str,
-) -> Result<()> {
-    // Placeholder
+pub fn basepair_error_ref(_outpath: &str, _largest_chr: &str) -> Result<()> {
     Ok(())
 }
 

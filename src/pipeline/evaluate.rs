@@ -196,19 +196,17 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
             -10.0 * (total_errors as f64 / valid_bases as f64).log10()
         };
 
-        // Write long_read_QV to summary_statistics (already created in Phase 2; append new entries)
-        let mut summary = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(format!("{}summary_statistics", outpath))?;
-        writeln!(summary, "Assembly error size\t{}", total_errors)?;
-        writeln!(summary, "Structural error\t{}", ae_len_structural_error)?;
-        writeln!(summary, "Base error\t{}", ae_len_base_error)?;
-        if long_read_qv.is_infinite() {
-            writeln!(summary, "long_read_QV\tInf")?;
-        } else {
-            writeln!(summary, "long_read_QV\t{:.2}", long_read_qv)?;
-        }
+        // Extract assembly name from first contig file for TSV naming
+        let assembly_name = config.contig.get(0)
+            .and_then(|f| std::path::Path::new(f).file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("assembly");
+        
+        // Write structural error TSV file
+        merge::write_structural_error_tsv(&outpath, assembly_name)?;
+        
+        // Write extended summary statistics
+        merge::write_summary_statistics_extended(&outpath, &fasta_stats, coverage, ae_len_structural_error, ae_len_base_error)?;
 
         // Log long_read_QV prominently
         if long_read_qv.is_infinite() {
@@ -250,162 +248,167 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
     use std::io::Write;
 
     // Pre-flight: verify tools are in PATH before touching any data files
-    utils::require_tool("minimap2")
-        .map_err(|e| anyhow::anyhow!("{}\n  Needed for: read-to-contig alignment", e))?;
-    utils::require_tool("samtools")
-        .map_err(|e| anyhow::anyhow!("{}\n  Needed for: BAM sorting and indexing", e))?;
+    info!("Checking required tools:");
+    writeln!(log, "Checking required tools:")?;
+    for (tool, purpose) in &[
+        ("minimap2", "read-to-contig alignment"),
+        ("samtools", "BAM sorting and indexing"),
+        ("seqkit",   "FASTQ splitting and subsampling"),
+    ] {
+        let version = utils::require_tool(tool)
+            .map_err(|e| anyhow::anyhow!("{}\n  Needed for: {}", e, purpose))?;
+        info!("  {} ({}): {}", tool, purpose, version);
+        writeln!(log, "  {} ({}): {}", tool, purpose, version)?;
+    }
 
-    let preset = utils::get_minimap2_preset(&config.datatype);
+    let _preset = utils::get_minimap2_preset(&config.datatype);
     let valid_contig_fa = format!("{}valid_contig.fa", outpath);
 
     // Verify the contig FASTA written by Phase 2 is present
     utils::validate_input_file(&valid_contig_fa)
         .map_err(|e| anyhow::anyhow!("Phase 2 output missing — {}", e))?;
 
-    const NUM_PARTS: usize = 4; // Split each FASTQ into 4 parts
+    const SPLIT_THRESHOLD_BP: u64 = 500_000_000;
+    const DEFAULT_NUM_PARTS: usize = 4;
+    let num_parts = if genome_size_bp > SPLIT_THRESHOLD_BP {
+        DEFAULT_NUM_PARTS
+    } else {
+        1
+    };
+
+    if num_parts > 1 {
+        info!(
+            "Genome size {} bp > {} bp: splitting each FASTQ into {} parts",
+            genome_size_bp,
+            SPLIT_THRESHOLD_BP,
+            num_parts,
+        );
+        writeln!(
+            log,
+            "Genome size {} bp > {} bp: splitting each FASTQ into {} parts",
+            genome_size_bp,
+            SPLIT_THRESHOLD_BP,
+            num_parts,
+        )?;
+    } else {
+        info!(
+            "Genome size {} bp <= {} bp: not splitting FASTQ inputs",
+            genome_size_bp,
+            SPLIT_THRESHOLD_BP,
+        );
+        writeln!(
+            log,
+            "Genome size {} bp <= {} bp: not splitting FASTQ inputs",
+            genome_size_bp,
+            SPLIT_THRESHOLD_BP,
+        )?;
+    }
+
     let mut all_bams = Vec::new();
 
-    // Coverage estimation will be done after first split (no pre-scan)
+    // Step 1: use seqkit stats to estimate combined read coverage across all input files
+    // This is fast and does not decode every base in Rust.
     let mut total_input_reads = 0usize;
     let mut total_input_bases = 0u64;
-    let mut keep_fraction: Option<f64> = None;
-    let mut coverage_reported = false;
+    for (idx, read_file) in config.read.iter().enumerate() {
+        match utils::seqkit_stats(read_file) {
+            Ok(stats) => {
+                info!("Read file #{}/{}: {} — {} reads, {} bp",
+                    idx + 1, config.read.len(), read_file, stats.reads, stats.bases);
+                writeln!(log, "Read file #{}: {} reads, {} bp", idx + 1, stats.reads, stats.bases)?;
+                total_input_reads += stats.reads;
+                total_input_bases += stats.bases;
+            }
+            Err(e) => {
+                warn!("seqkit stats failed for {}: {} — skipping coverage estimation", read_file, e);
+            }
+        }
+    }
 
+    let keep_fraction: Option<f64> = if genome_size_bp > 0 && total_input_bases > 0 {
+        let estimated_coverage = total_input_bases as f64 / genome_size_bp as f64;
+        if config.read_coverage > 0 && estimated_coverage > config.read_coverage as f64 {
+            let fraction = config.read_coverage as f64 / estimated_coverage;
+            info!(
+                "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling to target {}x (keep fraction {:.4})",
+                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage, fraction,
+            );
+            writeln!(log,
+                "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling to target {}x (keep fraction {:.4})",
+                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage, fraction,
+            )?;
+            Some(fraction)
+        } else {
+            info!(
+                "Estimated read coverage: {:.2}x across {} reads, {} bp; no subsampling needed (target {}x)",
+                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage,
+            );
+            writeln!(log,
+                "Estimated read coverage: {:.2}x across {} reads, {} bp; no subsampling needed (target {}x)",
+                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage,
+            )?;
+            None
+        }
+    } else {
+        warn!("Could not estimate read coverage (genome: {} bp, total read bases: {}); skipping subsampling",
+            genome_size_bp, total_input_bases);
+        writeln!(log, "Could not estimate read coverage; skipping subsampling")?;
+        None
+    };
+
+    // Step 2: for each read file — optionally subsample, then split with seqkit, then align
     for (read_idx, read_file) in config.read.iter().enumerate() {
-        // Verify read file is accessible before starting alignment
         utils::validate_input_file(read_file)
             .map_err(|e| anyhow::anyhow!("Read file #{} — {}", read_idx + 1, e))?;
 
-        info!("Splitting {} into {} parts", read_file, NUM_PARTS);
-
-        // Create workspace for this read file's split parts
         let split_dir = format!("{}split_workspace_read_{}/", outpath, read_idx + 1);
         std::fs::create_dir_all(&split_dir)?;
 
-        // Split the FASTQ into NUM_PARTS; per-part counts are returned during split (no re-read)
-        let split_result = utils::split_fastq_gz(read_file, &split_dir, NUM_PARTS, keep_fraction)?;
-
-        // On first read file, accumulate stats and estimate coverage
-        if read_idx == 0 && !coverage_reported {
-            total_input_reads += split_result.total_reads;
-            total_input_bases += split_result.total_bases;
-
-            // Estimate coverage from first file and decide keep fraction
-            if genome_size_bp > 0 && total_input_bases > 0 {
-                let estimated_coverage = total_input_bases as f64 / genome_size_bp as f64;
-                if config.read_coverage > 0 && estimated_coverage > config.read_coverage as f64 {
-                    keep_fraction = Some(config.read_coverage as f64 / estimated_coverage);
-                    info!(
-                        "Read file #{}: Estimated coverage = {:.2}x; subsampling to target {}x (keep fraction {:.4})",
-                        read_idx + 1,
-                        estimated_coverage,
-                        config.read_coverage,
-                        keep_fraction.unwrap(),
-                    );
-                    writeln!(
-                        log,
-                        "Read file #{}: Estimated coverage = {:.2}x; subsampling to target {}x (keep fraction {:.4})",
-                        read_idx + 1,
-                        estimated_coverage,
-                        config.read_coverage,
-                        keep_fraction.unwrap(),
-                    )?;
-                } else if total_input_bases > 0 {
-                    info!(
-                        "Read file #{}: Estimated coverage = {:.2}x; no subsampling needed (target {}x)",
-                        read_idx + 1,
-                        estimated_coverage,
-                        config.read_coverage,
-                    );
-                    writeln!(
-                        log,
-                        "Read file #{}: Estimated coverage = {:.2}x; no subsampling needed (target {}x)",
-                        read_idx + 1,
-                        estimated_coverage,
-                        config.read_coverage,
-                    )?;
-                }
-            } else {
-                warn!(
-                    "Could not estimate read coverage (genome: {}, bases: {}); skipping subsampling",
-                    genome_size_bp, total_input_bases,
-                );
-                writeln!(
-                    log,
-                    "Could not estimate read coverage (genome: {}, bases: {}); skipping subsampling",
-                    genome_size_bp, total_input_bases,
-                )?;
-            }
-            coverage_reported = true;
-
-            // If keep_fraction is set, re-split with subsampling
-            if keep_fraction.is_some() {
-                std::fs::remove_dir_all(&split_dir)?;
-                std::fs::create_dir_all(&split_dir)?;
-                let split_result = utils::split_fastq_gz(read_file, &split_dir, NUM_PARTS, keep_fraction)?;
-                info!(
-                    "Subsampled {} from {} reads / {} bp to {} reads / {} bp",
-                    read_file,
-                    split_result.total_reads,
-                    split_result.total_bases,
-                    split_result.written_reads,
-                    split_result.written_bases,
-                );
-                writeln!(
-                    log,
-                    "Subsampled {} from {} reads / {} bp to {} reads / {} bp",
-                    read_file,
-                    split_result.total_reads,
-                    split_result.total_bases,
-                    split_result.written_reads,
-                    split_result.written_bases,
-                )?;
-                process_split_bams(&split_result, config, NUM_PARTS, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
-                all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
-            } else {
-                process_split_bams(&split_result, config, NUM_PARTS, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
-                all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
-            }
-        } else if read_idx == 0 {
-            // Should not get here, but handle it
-            process_split_bams(&split_result, config, NUM_PARTS, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
-            all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
+        // Optionally subsample before splitting
+        let input_to_split = if let Some(fraction) = keep_fraction {
+            let subsampled = format!("{}subsampled.fastq.gz", split_dir);
+            info!("Subsampling {} (keep fraction {:.4}) -> {}", read_file, fraction, subsampled);
+            writeln!(log, "Subsampling {} (keep fraction {:.4})", read_file, fraction)?;
+            utils::seqkit_sample(read_file, &subsampled, fraction)?;
+            subsampled
         } else {
-            // Subsequent read files: use same keep_fraction as first file
-            info!(
-                "Read file #{} with keep_fraction = {}",
-                read_idx + 1,
-                keep_fraction.map(|f| format!("{:.4}", f)).unwrap_or_else(|| "None".to_string()),
-            );
-            process_split_bams(&split_result, config, NUM_PARTS, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
-            all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
+            read_file.clone()
+        };
+
+        let split_paths = if num_parts > 1 {
+            // Split with seqkit split2 — fast external tool, no re-read in Rust
+            info!("Splitting {} into {} parts with seqkit split2", input_to_split, num_parts);
+            let paths = utils::seqkit_split2(&input_to_split, &split_dir, num_parts)?;
+            info!("Split {} into {} parts", read_file, paths.len());
+            paths
+        } else {
+            info!("Using unsplit read input for {}", read_file);
+            vec![input_to_split]
+        };
+
+        for (i, p) in split_paths.iter().enumerate() {
+            writeln!(log, "  part {}: {}", i + 1, p)?;
         }
+
+        process_split_bams(&split_paths, config, num_parts, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
+        all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
     }
 
     // Helper to process split files and create merged BAM
     fn process_split_bams(
-        split_result: &utils::SplitFastqResult,
+        split_paths: &[String],
         config: &EvaluateConfig,
         num_parts: usize,
         valid_contig_fa: &str,
         split_dir: &str,
         read_idx: usize,
         outpath: &str,
-        log: &mut std::fs::File,
+        _log: &mut std::fs::File,
     ) -> Result<()> {
-        use std::io::Write;
-
-        info!("Reads per split part for read file {}:", read_idx + 1);
-        writeln!(log, "Reads per split part for read file {}:", read_idx + 1)?;
-        for (part_idx, &part_reads) in split_result.part_counts.iter().enumerate() {
-            info!("  part_{:02}.fastq.gz: {} reads", part_idx, part_reads);
-            writeln!(log, "  part_{:02}.fastq.gz: {} reads", part_idx, part_reads)?;
-        }
-
-        info!("Aligning {} parts (read file {}/{})", num_parts, read_idx + 1, config.read.len());
+        info!("Aligning {} split parts (read file {}/{})", split_paths.len(), read_idx + 1, config.read.len());
 
         // Process all parts in parallel using rayon
-        let part_bams: Vec<String> = split_result.paths.par_iter()
+        let part_bams: Vec<String> = split_paths.par_iter()
             .enumerate()
             .map(|(part_idx, split_fastq)| {
                 let bam_out = format!("{}part_{:02}.bam", split_dir, part_idx);

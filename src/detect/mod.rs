@@ -66,17 +66,19 @@ pub fn detect_sortbam(
         // Parse CIGAR to get indel signals
         let cigar_info = parse_cigar(record.flag, &record.rname, record.pos, &record.cigar, min_size, max_size);
 
-        // Write CIGAR-based signals immediately
+        // Write CIGAR-based signals: 7 fields matching Python debreak.temp layout:
+        // chrom  pos  size  type  readname  flag  mapq
+        // Field [6] (mapq) is used by the mergeinfo kernel for quality-weighted averaging.
         for (pos, len) in &cigar_info.insertions {
             sv_calls.push(format!(
-                "{}\t{}\t{}\tI-cigar\t{}",
-                chrom, pos, len, record.qname
+                "{}\t{}\t{}\tI-cigar\t{}\t{}\t{}",
+                chrom, pos, len, record.qname, record.flag, record.mapq
             ));
         }
         for (pos, len) in &cigar_info.deletions {
             sv_calls.push(format!(
-                "{}\t{}\t{}\tD-cigar\t{}",
-                chrom, pos, len, record.qname
+                "{}\t{}\t{}\tD-cigar\t{}\t{}\t{}",
+                chrom, pos, len, record.qname, record.flag, record.mapq
             ));
         }
 
@@ -109,6 +111,12 @@ pub fn detect_sortbam(
     use std::io::Write;
     for sv_call in sv_calls {
         writeln!(output, "{}", sv_call)?;
+    }
+
+    // Also write depth summary so mapping_info_contig can compute real coverage
+    let depth_file = format!("{}map_depth/read_to_contig_{}.depth", workpath, chrom);
+    if let Ok(mut df) = File::create(&depth_file) {
+        let _ = writeln!(df, "{}\t{}\t{}", chrom, number_reads, total_map_length);
     }
 
     info!("Wrote {} SV calls to {}", number_reads, output_file);

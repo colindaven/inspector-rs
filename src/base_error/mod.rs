@@ -57,7 +57,7 @@ pub fn get_snv(
 
     // Regex for parsing pileup (simplified)
     let indent_re = Regex::new(r"\+\d+").ok();
-    let del_re = Regex::new(r"-\d+").ok();
+    let _del_re = Regex::new(r"-\d+").ok();
 
     for line in reader.lines() {
         let line = line?;
@@ -162,7 +162,7 @@ pub fn get_snv(
 /// Count and filter base errors
 pub fn count_base_errors(
     path: &str,
-    ctg_total_length: u64,
+    _ctg_total_length: u64,
     _datatype: &str,
     _ave_depth: usize,
 ) -> Result<usize> {
