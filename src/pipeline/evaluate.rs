@@ -3,7 +3,6 @@
 
 use anyhow::Result;
 use log::{info, warn};
-use std::process::Command;
 use rayon::prelude::*;
 use crate::{static_analysis, detect, merge, base_error, plot, utils};
 
@@ -33,6 +32,12 @@ pub struct EvaluateConfig {
 pub fn run(config: EvaluateConfig) -> Result<()> {
     let start_time = std::time::Instant::now();
 
+    // Configure rayon thread pool from --thread before any par_iter usage.
+    // Ignore the error if the global pool was already initialised (e.g. in tests).
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(config.thread)
+        .build_global();
+
     // Validate inputs
     info!("Validating input files");
     utils::validate_input_files(&config.contig)?;
@@ -44,17 +49,8 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     utils::ensure_output_dir(&outpath)?;
 
     info!("Output directory: {}", outpath);
-
-    // Initialize logger
-    let log_file = format!("{}Inspector.log", outpath);
-    let mut log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_file)?;
-
-    use std::io::Write;
-    writeln!(log, "Inspector starting... {}", chrono::Local::now().format("%d/%m/%Y %H:%M:%S"))?;
-    writeln!(log, "Start Assembly evaluation with contigs: {:?}", config.contig)?;
+    info!("Inspector starting... {}", chrono::Local::now().format("%d/%m/%Y %H:%M:%S"));
+    info!("Start Assembly evaluation with contigs: {:?}", config.contig);
 
     // Phase 2: Static analysis (FASTA validation)
     info!("Phase 2: FASTA validation and statistics");
@@ -70,16 +66,20 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     info!("Large contigs: {}", fasta_stats.chromosomes_large.len());
 
     let t1 = std::time::Instant::now();
-    writeln!(log, "TIME: Before read mapping {}", (t1 - start_time).as_secs_f64())?;
+    info!("TIME: Before read mapping {}", (t1 - start_time).as_secs_f64());
 
     // Phase 3a: Read mapping (via minimap2 + samtools)
-    if !config.skip_read_mapping {
+    let bam_path = format!("{}read_to_contig.bam", outpath);
+    let bam_exists = std::path::Path::new(&bam_path).exists();
+    if !config.skip_read_mapping && !bam_exists {
         info!("Phase 3a: Mapping reads to contigs");
-        map_reads(&config, &outpath, fasta_stats.total_length, &mut log)?;
+        map_reads(&config, &outpath, fasta_stats.total_length)?;
+    } else if bam_exists {
+        info!("Phase 3a: Skipping alignment — {} already exists", bam_path);
     }
 
     let t2 = std::time::Instant::now();
-    writeln!(log, "TIME: Read Alignment: {}", (t2 - t1).as_secs_f64())?;
+    info!("TIME: Read Alignment: {}", (t2 - t1).as_secs_f64());
 
     // Phase 3b/4: SV detection and merging
     if !config.skip_structural_error_detect {
@@ -122,7 +122,7 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     info!("Min support: {}", min_support);
 
     let t3 = std::time::Instant::now();
-    writeln!(log, "TIME: Structural error signal detection: {}", (t3 - t2).as_secs_f64())?;
+    info!("TIME: Structural error signal detection: {}", (t3 - t2).as_secs_f64());
 
     // Phase 5: SV clustering and filtering
     let ae_len_structural_error;
@@ -148,10 +148,11 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     }
 
     let t4 = std::time::Instant::now();
-    writeln!(log, "TIME: Structural error clustering : {}", (t4 - t3).as_secs_f64())?;
+    info!("TIME: Structural error clustering : {}", (t4 - t3).as_secs_f64());
 
     // Phase 6: Base error detection
     let ae_len_base_error;
+    let base_error_counts;
     if !config.skip_base_error {
         info!("Phase 6: Base error detection");
         
@@ -171,22 +172,24 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
                 .collect::<Result<Vec<_>>>()?;
         }
         
-        ae_len_base_error = base_error::count_base_errors(
+        let counts = base_error::count_base_errors(
             &outpath,
             fasta_stats.total_length,
             &config.datatype,
             coverage,
         )?;
+        ae_len_base_error = counts.total;
+        base_error_counts = counts;
     } else {
         ae_len_base_error = 0;
+        base_error_counts = base_error::BaseErrorCounts::default();
     }
 
     let t5 = std::time::Instant::now();
-    writeln!(log, "TIME: Small-scale error detection: {}", (t5 - t4).as_secs_f64())?;
+    info!("TIME: Small-scale error detection: {}", (t5 - t4).as_secs_f64());
 
     // Compute long_read_QV — always, regardless of error count
     {
-        use std::io::Write;
         let total_errors = ae_len_structural_error + ae_len_base_error;
         let valid_bases = fasta_stats.total_length;
 
@@ -206,7 +209,7 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
         merge::write_structural_error_tsv(&outpath, assembly_name)?;
         
         // Write extended summary statistics
-        merge::write_summary_statistics_extended(&outpath, &fasta_stats, coverage, ae_len_structural_error, ae_len_base_error)?;
+        merge::write_summary_statistics_extended(&outpath, &fasta_stats, coverage, ae_len_structural_error, &base_error_counts)?;
 
         // Log long_read_QV prominently
         if long_read_qv.is_infinite() {
@@ -216,17 +219,10 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
             info!("Assembly error size: {} (structural: {}, base: {})", total_errors, ae_len_structural_error, ae_len_base_error);
             info!("long_read_QV: {:.2}", long_read_qv);
         }
-
-        writeln!(log, "Assembly error size: {}", total_errors)?;
-        if long_read_qv.is_infinite() {
-            writeln!(log, "long_read_QV: Inf")?;
-        } else {
-            writeln!(log, "long_read_QV: {:.2}", long_read_qv)?;
-        }
     }
 
     let t6 = std::time::Instant::now();
-    writeln!(log, "TIME: long_read_QV calculation: {}", (t6 - t5).as_secs_f64())?;
+    info!("TIME: long_read_QV calculation: {}", (t6 - t5).as_secs_f64());
 
     // Phase 7: Plotting
     if !config.noplot {
@@ -236,20 +232,16 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     }
 
     let total_time = std::time::Instant::now();
-    writeln!(log, "Inspector finished. Total time: {}", (total_time - start_time).as_secs_f64())?;
-
+    info!("Inspector finished. Total time: {}", (total_time - start_time).as_secs_f64());
     info!("Assembly evaluation complete in {:.2}s", (total_time - start_time).as_secs_f64());
     Ok(())
 }
 
 /// Wrapper for read-to-contig alignment using minimap2 and samtools
 /// Splits each FASTQ into NUM_PARTS (default 4) parts, runs minimap2 concurrently, then merges BAMs
-fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &mut std::fs::File) -> Result<()> {
-    use std::io::Write;
-
+fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64) -> Result<()> {
     // Pre-flight: verify tools are in PATH before touching any data files
     info!("Checking required tools:");
-    writeln!(log, "Checking required tools:")?;
     for (tool, purpose) in &[
         ("minimap2", "read-to-contig alignment"),
         ("samtools", "BAM sorting and indexing"),
@@ -258,10 +250,10 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         let version = utils::require_tool(tool)
             .map_err(|e| anyhow::anyhow!("{}\n  Needed for: {}", e, purpose))?;
         info!("  {} ({}): {}", tool, purpose, version);
-        writeln!(log, "  {} ({}): {}", tool, purpose, version)?;
     }
 
-    let _preset = utils::get_minimap2_preset(&config.datatype);
+    let preset = utils::get_minimap2_preset(&config.datatype);
+    info!("minimap2 preset for datatype '{}': {}", config.datatype, preset);
     let valid_contig_fa = format!("{}valid_contig.fa", outpath);
 
     // Verify the contig FASTA written by Phase 2 is present
@@ -283,25 +275,12 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
             SPLIT_THRESHOLD_BP,
             num_parts,
         );
-        writeln!(
-            log,
-            "Genome size {} bp > {} bp: splitting each FASTQ into {} parts",
-            genome_size_bp,
-            SPLIT_THRESHOLD_BP,
-            num_parts,
-        )?;
     } else {
         info!(
             "Genome size {} bp <= {} bp: not splitting FASTQ inputs",
             genome_size_bp,
             SPLIT_THRESHOLD_BP,
         );
-        writeln!(
-            log,
-            "Genome size {} bp <= {} bp: not splitting FASTQ inputs",
-            genome_size_bp,
-            SPLIT_THRESHOLD_BP,
-        )?;
     }
 
     let mut all_bams = Vec::new();
@@ -315,7 +294,6 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
             Ok(stats) => {
                 info!("Read file #{}/{}: {} — {} reads, {} bp",
                     idx + 1, config.read.len(), read_file, stats.reads, stats.bases);
-                writeln!(log, "Read file #{}: {} reads, {} bp", idx + 1, stats.reads, stats.bases)?;
                 total_input_reads += stats.reads;
                 total_input_bases += stats.bases;
             }
@@ -333,26 +311,17 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
                 "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling to target {}x (keep fraction {:.4})",
                 estimated_coverage, total_input_reads, total_input_bases, config.read_coverage, fraction,
             );
-            writeln!(log,
-                "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling to target {}x (keep fraction {:.4})",
-                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage, fraction,
-            )?;
             Some(fraction)
         } else {
             info!(
                 "Estimated read coverage: {:.2}x across {} reads, {} bp; no subsampling needed (target {}x)",
                 estimated_coverage, total_input_reads, total_input_bases, config.read_coverage,
             );
-            writeln!(log,
-                "Estimated read coverage: {:.2}x across {} reads, {} bp; no subsampling needed (target {}x)",
-                estimated_coverage, total_input_reads, total_input_bases, config.read_coverage,
-            )?;
             None
         }
     } else {
         warn!("Could not estimate read coverage (genome: {} bp, total read bases: {}); skipping subsampling",
             genome_size_bp, total_input_bases);
-        writeln!(log, "Could not estimate read coverage; skipping subsampling")?;
         None
     };
 
@@ -368,7 +337,6 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         let input_to_split = if let Some(fraction) = keep_fraction {
             let subsampled = format!("{}subsampled.fastq.gz", split_dir);
             info!("Subsampling {} (keep fraction {:.4}) -> {}", read_file, fraction, subsampled);
-            writeln!(log, "Subsampling {} (keep fraction {:.4})", read_file, fraction)?;
             utils::seqkit_sample(read_file, &subsampled, fraction)?;
             subsampled
         } else {
@@ -387,10 +355,10 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         };
 
         for (i, p) in split_paths.iter().enumerate() {
-            writeln!(log, "  part {}: {}", i + 1, p)?;
+            info!("  part {}: {}", i + 1, p);
         }
 
-        process_split_bams(&split_paths, config, num_parts, &valid_contig_fa, &split_dir, read_idx, outpath, log)?;
+        process_split_bams(&split_paths, config, num_parts, &valid_contig_fa, &split_dir, read_idx, outpath, preset)?;
         all_bams.push(format!("{}read_to_contig_{}.bam", outpath, read_idx + 1));
     }
 
@@ -403,7 +371,7 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         split_dir: &str,
         read_idx: usize,
         outpath: &str,
-        _log: &mut std::fs::File,
+        preset: &str,
     ) -> Result<()> {
         info!("Aligning {} split parts (read file {}/{})", split_paths.len(), read_idx + 1, config.read.len());
 
@@ -413,16 +381,20 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
             .map(|(part_idx, split_fastq)| {
                 let bam_out = format!("{}part_{:02}.bam", split_dir, part_idx);
 
-                // Run minimap2 + samtools for this part
+                // Run minimap2 | samtools sort — piped so no intermediate SAM file touches disk.
+                // -x preset: critical for accuracy and speed (map-hifi / map-ont / map-pb)
+                // -a: SAM output (piped to samtools)
+                // -Q: don't output base qualities in SAM (not needed downstream, saves I/O)
+                // -N 1: keep at most 1 secondary alignment
+                // --secondary=no: cleaner — omit secondary alignments entirely (flag 256)
+                // -I 10G: index batch size; prevents re-indexing on large genomes
                 let minimap = std::process::Command::new("minimap2")
                     .arg("-a")
+                    .arg("-x").arg(preset)
                     .arg("-Q")
-                    .arg("-N")
-                    .arg("1")
-                    .arg("-I")
-                    .arg("10G")
-                    .arg("-t")
-                    .arg((config.thread / num_parts).max(1).to_string())
+                    .arg("--secondary=no")
+                    .arg("-I").arg("10G")
+                    .arg("-t").arg((config.thread / num_parts).max(1).to_string())
                     .arg(valid_contig_fa)
                     .arg(split_fastq)
                     .stdout(std::process::Stdio::piped())
@@ -438,6 +410,11 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
                     .stdin(minimap.stdout.unwrap())
                     .output()
                     .map_err(|e| anyhow::anyhow!("Failed to start samtools sort on part {}: {}", part_idx, e))?;
+
+                // Log command output to Inspector.log
+                if !samtools.stderr.is_empty() {
+                    utils::log_command_output("samtools_sort", &samtools.stderr);
+                }
 
                 if !samtools.status.success() {
                     return Err(anyhow::anyhow!("samtools sort failed on part {}", part_idx));
@@ -458,6 +435,11 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
                 .args(&part_bams)
                 .output()
                 .map_err(|e| anyhow::anyhow!("Failed to merge BAM parts: {}", e))?;
+
+            // Log command output to Inspector.log
+            if !merge.stderr.is_empty() {
+                utils::log_command_output("samtools_merge", &merge.stderr);
+            }
 
             if !merge.status.success() {
                 anyhow::bail!("samtools merge failed");
@@ -510,6 +492,11 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         .output()
         .map_err(|e| anyhow::anyhow!("Failed to start samtools index: {}", e))?;
 
+    // Log command output to Inspector.log
+    if !index.stderr.is_empty() {
+        utils::log_command_output("samtools_index", &index.stderr);
+    }
+
     if !index.status.success() {
         let stderr = String::from_utf8_lossy(&index.stderr);
         anyhow::bail!("samtools index failed: {}", stderr);
@@ -541,7 +528,6 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64, log: &
         }
 
         info!("Final BAM statistics: {} total reads, {} mapped", total_reads_in_bam, mapped_reads);
-        writeln!(log, "Final BAM statistics: {} total reads, {} mapped", total_reads_in_bam, mapped_reads)?;
     }
 
     info!("Read mapping and BAM merge complete");

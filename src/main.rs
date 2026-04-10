@@ -201,11 +201,6 @@ enum Commands {
 }
 
 fn main() -> Result<()> {
-    // Initialize default logger to stdout (for early startup messages)
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
-
     let cli = Cli::parse();
 
     match cli.command {
@@ -229,7 +224,7 @@ fn main() -> Result<()> {
             skip_base_error,
             skip_base_error_detect,
         } => {
-            // Initialize file logger now that we know the output path
+            // Initialize file logger FIRST (before any log messages)
             // Log file goes in the output root directory (not subdir), truncate on start
             let normalized_outpath = inspector::utils::normalize_path(&outpath);
             let log_file_path = format!("{}Inspector.log", normalized_outpath);

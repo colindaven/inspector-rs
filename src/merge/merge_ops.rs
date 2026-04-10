@@ -184,6 +184,78 @@ pub fn merge_with_bimodal(candi: &[String], min_support: usize) -> Vec<String> {
     }
 }
 
+/// Adaptive-window clustering of SV signals, mirroring Python `counttime_insertion` /
+/// `counttime_deletion` from debreak_merge.py.
+///
+/// Algorithm:
+/// 1. Sort signals by (position, size).
+/// 2. Start with `window = 100`.
+/// 3. If the next event falls within `[start, start + window)`, accumulate.
+/// 4. Otherwise, if `window == 100` (not yet adapted for this cluster), adapt window from
+///    the mean size of the current cluster:
+///      mean ≤ 100  →  window = 200
+///      mean ≤ 500  →  window = 400
+///      mean  > 500 →  window = 800
+///    Re-check: if the event now falls in the adapted window, absorb it.
+/// 5. If still outside, flush the cluster (→ `merge_with_bimodal` if len ≥ min_support)
+///    and start a new cluster from the current event with window reset to 100.
+///
+/// This matches the Python behaviour for large SVs (it is applied to all signal sizes;
+/// for small SVs the depth-map path is used instead and this function is not called).
+pub fn counttime_cluster(signals: &[String], min_support: usize) -> Vec<String> {
+    if signals.is_empty() {
+        return Vec::new();
+    }
+
+    // Sort a copy by (pos, size)
+    let mut sorted = signals.to_vec();
+    sorted.sort_by_key(|l| (parse_pos(l), parse_size(l)));
+
+    let mut results: Vec<String> = Vec::new();
+    let mut candi: Vec<String> = vec![sorted[0].clone()];
+    let mut start = parse_pos(&sorted[0]);
+    let mut window: u64 = 100;
+
+    for event in sorted.into_iter().skip(1) {
+        let ev_pos = parse_pos(&event);
+        if ev_pos <= start + window {
+            candi.push(event);
+        } else {
+            // Event is outside current window. Adapt window if not yet done.
+            if window == 100 {
+                let mean_size: u64 = if candi.is_empty() {
+                    0
+                } else {
+                    candi.iter().map(|l| parse_size(l)).sum::<u64>() / candi.len() as u64
+                };
+                window = if mean_size <= 100 { 200 } else if mean_size <= 500 { 400 } else { 800 };
+
+                // Re-check with adapted window
+                if ev_pos <= start + window {
+                    candi.push(event);
+                    continue;
+                }
+            }
+
+            // Flush current cluster
+            if candi.len() >= min_support {
+                results.extend(merge_with_bimodal(&candi, min_support));
+            }
+            // Start new cluster
+            start = ev_pos;
+            window = 100;
+            candi = vec![event];
+        }
+    }
+
+    // Flush final cluster
+    if candi.len() >= min_support {
+        results.extend(merge_with_bimodal(&candi, min_support));
+    }
+
+    results
+}
+
 /// Merge insertion signals (kept for API compatibility — unused by new pipeline)
 pub fn merge_insertions(signals: &[(u64, usize)]) -> Vec<(u64, usize)> {
     signals.to_vec()

@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use anyhow::Result;
 use log::info;
-use crate::merge::merge_ops::merge_with_bimodal;
+use crate::merge::merge_ops::{merge_with_bimodal, counttime_cluster};
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -31,29 +31,18 @@ fn sig_size(line: &str) -> u64 {
     line.split('\t').nth(2).and_then(|s| s.parse().ok()).unwrap_or(0)
 }
 
-/// Fixed-window grouping for large SVs (>2000 bp).
-fn cluster_large_svs(signals: &[String], min_support: usize, window: u64) -> Vec<String> {
-    if signals.is_empty() { return Vec::new(); }
-    let mut sorted = signals.to_vec();
-    sorted.sort_by_key(|l| (sig_pos(l), sig_size(l)));
-    let mut results = Vec::new();
-    let mut candi: Vec<String> = Vec::new();
-    let mut start = sig_pos(&sorted[0]);
-    for event in sorted {
-        if sig_pos(&event) <= start + window {
-            candi.push(event);
-        } else {
-            if candi.len() >= min_support {
-                results.extend(merge_with_bimodal(&candi, min_support));
-            }
-            start = sig_pos(&event);
-            candi = vec![event];
-        }
-    }
-    if candi.len() >= min_support {
-        results.extend(merge_with_bimodal(&candi, min_support));
-    }
-    results
+/// Return field[3] (the SV type marker, e.g. "I-cigar", "D-segment", "INV-segment").
+/// Using this to filter prevents false matches when a chromosome name, read name, or
+/// any other field in the tab-delimited line happens to contain the marker substring.
+fn sig_type(line: &str) -> &str {
+    line.split('\t').nth(3).unwrap_or("")
+}
+
+/// Adaptive-window grouping for large SVs (>2000 bp).
+/// Delegates to `counttime_cluster` which replicates Python's `counttime_insertion` /
+/// `counttime_deletion` adaptive window (100 → 200/400/800 bp by mean cluster size).
+fn cluster_large_svs(signals: &[String], min_support: usize, _window: u64) -> Vec<String> {
+    counttime_cluster(signals, min_support)
 }
 
 /// Depth-map spatial clustering for small SVs (<=3000bp).
@@ -146,10 +135,12 @@ pub fn cluster(
     info!("Clustering deletions for {}", chrom);
     let all_sv = read_debreak_temp(outpath, chrom)?;
 
-    let large_del: Vec<String> = all_sv.iter().filter(|l| l.contains("D-") && sig_size(l) > 2000).cloned().collect();
+    let large_del: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with("D-") && sig_size(l) > 2000).cloned().collect();
     let large_merged = cluster_large_svs(&large_del, min_support, 1600);
 
-    let small_del: Vec<String> = all_sv.iter().filter(|l| l.contains("D-") && sig_size(l) <= 3000).cloned().collect();
+    let small_del: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with("D-") && sig_size(l) <= 3000).cloned().collect();
+    info!("  del {}: {} total signals, {} large (>2000), {} small (<=3000)",
+          chrom, all_sv.len(), large_del.len(), small_del.len());
     let small_annotated = cluster_small_svs_depth_map(&small_del, contig_length, max_depth, min_support,
         |pos, size| { let s = (pos as usize).saturating_sub(1); let e = (pos + size) as usize; (s, e) },
         |pos, size, r_start, r_end| { let end = pos + size; end > r_start as u64 && pos < r_end as u64 },
@@ -182,10 +173,12 @@ pub fn cluster_insertions(
     info!("Clustering {}s for {}", type_label, chrom);
     let all_sv = read_debreak_temp(outpath, chrom)?;
 
-    let large_sv: Vec<String> = all_sv.iter().filter(|l| l.contains(signal_marker) && sig_size(l) > 2000).cloned().collect();
+    let large_sv: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with(signal_marker) && sig_size(l) > 2000).cloned().collect();
     let large_merged = cluster_large_svs(&large_sv, min_support, 1600);
 
-    let small_sv: Vec<String> = all_sv.iter().filter(|l| l.contains(signal_marker) && sig_size(l) <= 3000).cloned().collect();
+    let small_sv: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with(signal_marker) && sig_size(l) <= 3000).cloned().collect();
+    info!("  {} {}: {} total signals, {} large (>2000), {} small (<=3000)",
+          type_label, chrom, all_sv.len(), large_sv.len(), small_sv.len());
     let small_annotated = cluster_small_svs_depth_map(&small_sv, contig_length, max_depth, min_support,
         |pos, _size| { let s = (pos as usize).saturating_sub(101); let e = pos as usize + 101; (s, e) },
         |pos, _size, r_start, r_end| {
@@ -292,6 +285,9 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
     let mut exp: Vec<String> = allsv_raw.iter().filter(|c| c.contains("Exp")).cloned().collect();
     let mut col: Vec<String> = allsv_raw.iter().filter(|c| c.contains("Col")).cloned().collect();
     let inv: Vec<String> = allsv_raw.iter().filter(|c| c.contains("Inv")).cloned().collect();
+
+    info!("filter_errors: {} Expansion, {} Collapse, {} Inversion candidates (lowcov={}, highcov={})",
+        exp.len(), col.len(), inv.len(), lowcov, highcov);
 
     let uniq_count = |reads: &str| -> usize {
         let mut v: Vec<&str> = reads.split(';').filter(|s| !s.is_empty()).collect();
@@ -418,6 +414,8 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
     }
 
     let mut filtered: Vec<String> = Vec::new();
+    info!("filter_errors: {} total pre-filter SVs (lowcov={}, highcov={}, rat={}, min_support=10)",
+          allsv.len(), lowcov, highcov, rat);
     for line in allsv {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 10 { continue; }
@@ -425,8 +423,23 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
         let depth_min: i64 = f[9].parse().unwrap_or(0);
         let sizes = parse_size_field(f[5]);
         let max_size = sizes.into_iter().max().unwrap_or(0);
-        if max_size < min_size as i64 { continue; }
-        if support >= 10 && (support as f64) >= rat * depth_min as f64 && lowcov <= depth_min && depth_min < highcov {
+        if max_size < min_size as i64 {
+            info!("  SKIP size={} < min_size={}: {}\t{}", max_size, min_size, f[0], f[1]);
+            continue;
+        }
+        let pass = support >= 10
+            && (support as f64) >= rat * depth_min as f64
+            && lowcov <= depth_min
+            && depth_min < highcov;
+        if !pass {
+            info!("  SKIP {}/{} @ {}:{} support={} depth_min={} (need >={} and >={:.1} and cov [{},{}])",
+                  f[4], f[5], f[0], f[1],
+                  support, depth_min,
+                  10,
+                  rat * depth_min as f64,
+                  lowcov, highcov);
+        }
+        if pass {
             filtered.push(line);
         }
     }
@@ -440,18 +453,28 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
     let col_n = filtered.iter().filter(|l| l.contains("Col")).count();
     let het_n = filtered.iter().filter(|l| l.contains("Haplo")).count();
     let inv_n = filtered.iter().filter(|l| l.contains("Inv")).count();
+    // Append structural error counts to the main summary_statistics file (no .txt)
     let mut summary = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(format!("{}summary_statistics.txt", outpath))?;
+        .open(format!("{}summary_statistics", outpath))?;
     writeln!(summary, "Structural error\t{}", filtered.len())?;
     writeln!(summary, "Expansion\t{}", exp_n)?;
     writeln!(summary, "Collapse\t{}", col_n)?;
     writeln!(summary, "Haplotype switch\t{}", het_n)?;
     writeln!(summary, "Inversion\t{}", inv_n)?;
 
-    let _ = std::fs::remove_file(format!("{}assembly_errors.bed", outpath));
-    let _ = std::fs::remove_file(format!("{}assembly_errors.bed-gt", outpath));
+    // Rename rather than delete so intermediate files can be inspected after the run.
+    // assembly_errors.bed → assembly_errors.bed.pre_filter
+    // assembly_errors.bed-gt → assembly_errors.bed-gt.pre_filter
+    let _ = std::fs::rename(
+        format!("{}assembly_errors.bed", outpath),
+        format!("{}assembly_errors.bed.pre_filter", outpath),
+    );
+    let _ = std::fs::rename(
+        format!("{}assembly_errors.bed-gt", outpath),
+        format!("{}assembly_errors.bed-gt.pre_filter", outpath),
+    );
     let _ = std::fs::remove_file(format!("{}read_to_contig.debreak.temp", outpath));
 
     let mut totalbase = 0usize;
@@ -511,33 +534,62 @@ pub fn write_structural_error_tsv(outpath: &str, base_name: &str) -> Result<()> 
     Ok(())
 }
 
-/// Append extended summary statistics to summary_statistics file.
+/// Append the small-scale error section and QV to summary_statistics, matching Python output.
 pub fn write_summary_statistics_extended(
     outpath: &str,
     fasta_stats: &crate::static_analysis::FastaStats,
     coverage: usize,
     ae_len_structural_error: usize,
-    ae_len_base_error: usize,
+    base_error_counts: &crate::base_error::BaseErrorCounts,
 ) -> Result<()> {
+    let ae_len_base_error = base_error_counts.total;
     let total_errors = ae_len_structural_error + ae_len_base_error;
-    let valid_bases  = fasta_stats.total_length;
-    let long_read_qv = if total_errors == 0 || valid_bases == 0 { f64::INFINITY }
-        else { -10.0 * (total_errors as f64 / valid_bases as f64).log10() };
-    let mut summary = std::fs::OpenOptions::new().create(true).append(true)
+
+    // Use validbase from pileup if available (matches Python QV denominator),
+    // otherwise fall back to total assembly length.
+    let denominator = if base_error_counts.valid_bases > 0 {
+        base_error_counts.valid_bases
+    } else {
+        fasta_stats.total_length
+    };
+
+    let qv = if total_errors == 0 || denominator == 0 {
+        f64::INFINITY
+    } else {
+        -10.0 * (total_errors as f64 / denominator as f64).log10()
+    };
+
+    // Append to the same summary_statistics file started by simple_fasta() and filter_errors().
+    let mut summary = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
         .open(format!("{}summary_statistics", outpath))?;
+
+    // Small-scale error section (Python writes this from count_baseerrror())
+    let per_mbp = if fasta_stats.total_length > 0 {
+        ae_len_base_error as f64 / fasta_stats.total_length as f64 * 1_000_000.0
+    } else {
+        0.0
+    };
     writeln!(summary)?;
-    writeln!(summary, "Assembly error size\t{}", total_errors)?;
-    writeln!(summary, "Structural error size\t{}", ae_len_structural_error)?;
-    writeln!(summary, "Base error\t{}", ae_len_base_error)?;
-    writeln!(summary, "Average coverage\t{}", coverage)?;
-    if long_read_qv.is_infinite() { writeln!(summary, "long_read_QV\tInf")?; }
-    else { writeln!(summary, "long_read_QV\t{:.2}", long_read_qv)?; }
     writeln!(summary)?;
-    writeln!(summary, "Total contigs\t{}", fasta_stats.chromosomes.len())?;
-    writeln!(summary, "Large contigs (>=10Mbp)\t{}", fasta_stats.chromosomes_large.len())?;
-    writeln!(summary, "Total length\t{}", fasta_stats.total_length)?;
-    writeln!(summary, "Longest contig\t{}", fasta_stats.largest_contig_length)?;
-    writeln!(summary, "N50\t{}", fasta_stats.n50)?;
+    writeln!(summary, "Small-scale assembly error /per Mbp\t{}", per_mbp)?;
+    writeln!(summary, "Total small-scale assembly error\t{}", ae_len_base_error)?;
+    writeln!(summary, "Base substitution\t{}", base_error_counts.base_substitution)?;
+    writeln!(summary, "Small-scale expansion\t{}", base_error_counts.small_scale_expansion)?;
+    writeln!(summary, "Small-scale collapse\t{}", base_error_counts.small_scale_collapse)?;
+
+    // Coverage line (from mapping depth)
+    writeln!(summary)?;
+    writeln!(summary, "Depth\t{}", coverage)?;
+
+    // QV — matching Python label exactly
+    if qv.is_infinite() {
+        writeln!(summary, "\nQV\tInf")?;
+    } else {
+        writeln!(summary, "\nQV\t{}", qv)?;
+    }
+
     Ok(())
 }
 

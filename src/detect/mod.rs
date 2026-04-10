@@ -55,13 +55,18 @@ pub fn detect_sortbam(
             continue;
         };
 
-        // Skip secondary alignments (we only want primary + supplementary)
+        // Skip secondary alignments (we only want primary + supplementary for SV detection)
         if (record.flag & 256) != 0 {
             continue; // secondary
         }
 
-        number_reads += 1;
-        total_map_length += record.seq_len as u64;
+        // Only count primary reads for coverage — not supplementary split-read components.
+        // Mirrors Python detect_sortbam: totalmaplength is updated only in the `else` branch
+        // (non-supplementary), so split reads aren't double-counted.
+        if (record.flag & 0x800) == 0 {
+            number_reads += 1;
+            total_map_length += record.seq_len as u64;
+        }
 
         // Parse CIGAR to get indel signals
         let cigar_info = parse_cigar(record.flag, &record.rname, record.pos, &record.cigar, min_size, max_size);
@@ -156,7 +161,7 @@ pub fn detect_sortbam_nosv(
             continue;
         };
 
-        if (record.flag & 256) == 0 { // Not secondary
+        if (record.flag & 256) == 0 && (record.flag & 0x800) == 0 { // Not secondary, not supplementary
             number_reads += 1;
             total_map_length += record.seq_len as u64;
         }

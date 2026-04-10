@@ -32,9 +32,11 @@ pub fn simple_fasta(
     let mut chromosomes_map = HashMap::new();
     let mut chromosomes_large = Vec::new();
     let mut contig_lengths = HashMap::new();
-    let mut all_lengths = Vec::new();
+    let mut all_lengths: Vec<u64> = Vec::new();
     let mut total_length = 0u64;
     let mut total_length_large = 0u64;
+    let mut total_length_all = 0u64;
+    let mut total_length_above_ae = 0u64;
 
     // Write valid contigs and compute statistics
     let valid_fa_path = format!("{}valid_contig.fa", outpath);
@@ -45,6 +47,7 @@ pub fn simple_fasta(
     for contig in all_contigs {
         let seq_len = contig.sequence.len() as u64;
         all_lengths.push(seq_len);
+        total_length_all += seq_len;
         contig_lengths.insert(contig.name.clone(), seq_len);
 
         // Write to contig info file
@@ -59,6 +62,7 @@ pub fn simple_fasta(
             if seq_len >= min_size_assembly_error as u64 {
                 chromosomes_large.push(contig.name.clone());
                 total_length_large += seq_len;
+                total_length_above_ae += seq_len;
             }
 
             // Write valid contig to FASTA
@@ -67,11 +71,26 @@ pub fn simple_fasta(
         }
     }
 
-    // Compute N50
-    let n50 = utils::compute_n50(all_lengths);
+    // Sort lengths descending for N50 and rank queries
+    let mut sorted_lengths = all_lengths.clone();
+    sorted_lengths.sort_unstable_by(|a, b| b.cmp(a));
 
-    // Get largest contig length
-    let largest_contig_length = contig_lengths.values().max().copied().unwrap_or(0);
+    // N50 over all contigs (Python uses all_lengths for the main N50)
+    let n50 = compute_n50_sorted(&sorted_lengths);
+
+    // N50 of contigs > min_size_assembly_error
+    let large_lengths: Vec<u64> = sorted_lengths
+        .iter()
+        .filter(|&&l| l > min_size_assembly_error as u64)
+        .copied()
+        .collect();
+    let n50_large = compute_n50_sorted(&large_lengths);
+
+    let largest_contig_length = sorted_lengths.first().copied().unwrap_or(0);
+    let second_largest_contig_length = sorted_lengths.get(1).copied().unwrap_or(0);
+
+    let total_contig_count_all = sorted_lengths.len();
+    let count_above_ae_size = large_lengths.len();
 
     let stats = FastaStats {
         chromosomes: chromosomes.clone(),
@@ -81,38 +100,57 @@ pub fn simple_fasta(
         total_length_large,
         n50,
         largest_contig_length,
+        second_largest_contig_length,
         contig_lengths,
+        total_contig_count_all,
+        total_length_all,
+        count_above_ae_size,
+        total_length_above_ae_size: total_length_above_ae,
+        min_size_used: min_size,
+        min_size_ae_used: min_size_assembly_error,
     };
 
-    // Write summary statistics
+    // Write summary statistics — Python-compatible "Statics of contigs:" section
     let summary_path = format!("{}summary_statistics", outpath);
     let mut summary = File::create(&summary_path)?;
-    writeln!(summary, "Contig number\t{}", stats.chromosomes.len())?;
-    writeln!(summary, "Total contig length\t{}", stats.total_length)?;
+    writeln!(summary, "Statics of contigs:")?;
+    writeln!(summary, "Number of contigs\t{}", stats.total_contig_count_all)?;
+    writeln!(summary, "Number of contigs > {} bp\t{}", min_size, stats.chromosomes.len())?;
+    writeln!(summary, "Number of contigs >{} bp\t{}", min_size_assembly_error, stats.count_above_ae_size)?;
+    writeln!(summary, "Total length\t{}", stats.total_length_all)?;
+    writeln!(summary, "Total length of contigs > {} bp\t{}", min_size, stats.total_length)?;
+    writeln!(summary, "Total length of contigs >{}bp\t{}", min_size_assembly_error, stats.total_length_above_ae_size)?;
     writeln!(summary, "Longest contig\t{}", stats.largest_contig_length)?;
+    if stats.second_largest_contig_length > 0 {
+        writeln!(summary, "Second longest contig length\t{}", stats.second_largest_contig_length)?;
+    }
     writeln!(summary, "N50\t{}", stats.n50)?;
-    writeln!(
-        summary,
-        "N50 (large contigs)\t{}",
-        utils::compute_n50(
-            stats
-                .chromosomes_large
-                .iter()
-                .filter_map(|c| stats.contig_lengths.get(c).copied())
-                .collect(),
-        )
-    )?;
+    writeln!(summary, "N50 of contigs >{}bp\t{}", min_size_assembly_error, n50_large)?;
+    writeln!(summary)?;
+    writeln!(summary)?;
 
-    info!("Contigs: {}", stats.chromosomes.len());
+    info!("Contigs: {} total, {} > {}bp, {} > {}bp",
+        stats.total_contig_count_all, stats.chromosomes.len(), min_size,
+        stats.count_above_ae_size, min_size_assembly_error);
     info!("Total length: {}", utils::format_size(stats.total_length));
     info!("N50: {}", utils::format_size(stats.n50));
-    info!(
-        "Large contigs (≥{}bp): {}",
-        min_size_assembly_error,
-        stats.chromosomes_large.len()
-    );
 
     Ok(stats)
+}
+
+/// Compute N50 from a pre-sorted (descending) list of lengths.
+fn compute_n50_sorted(sorted_lengths: &[u64]) -> u64 {
+    let total: u64 = sorted_lengths.iter().sum();
+    if total == 0 { return 0; }
+    let half = total / 2;
+    let mut acc = 0u64;
+    for &l in sorted_lengths {
+        acc += l;
+        if acc >= half {
+            return l;
+        }
+    }
+    0
 }
 
 /// Aggregate mapping statistics from depth files
@@ -198,11 +236,14 @@ pub fn assembly_info_cluster(
     let parse = |line: &str| -> Option<(String, u64, u64, String, String)> {
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 8 {
+            info!("  assembly_info_cluster SKIP (too few fields={}): {}", f.len(), &line[..line.len().min(80)]);
             return None;
         }
         let pos: u64 = f[1].parse().ok()?;
         let size: u64 = f[2].parse().ok()?;
         if (size as usize) < min_size || (size as usize) > max_size {
+            info!("  assembly_info_cluster SKIP (size={} not in [{},{}]): {}",
+                  size, min_size, max_size, &line[..line.len().min(80)]);
             return None;
         }
         Some((f[0].to_string(), pos, size, f[3].to_string(), f[7].to_string()))
@@ -292,5 +333,18 @@ pub struct FastaStats {
     pub total_length_large: u64,
     pub n50: u64,
     pub largest_contig_length: u64,
+    pub second_largest_contig_length: u64,
     pub contig_lengths: HashMap<String, u64>,
+    /// Total contig count including those below min_size
+    pub total_contig_count_all: usize,
+    /// Total assembly length including all contigs
+    pub total_length_all: u64,
+    /// Count of contigs >= min_size_assemblyerror (for SV detection)
+    pub count_above_ae_size: usize,
+    /// Total length of contigs >= min_size_assemblyerror
+    pub total_length_above_ae_size: u64,
+    /// The min_size threshold used for filtering (for output labels)
+    pub min_size_used: usize,
+    /// The min_size_assemblyerror threshold used (for output labels)
+    pub min_size_ae_used: usize,
 }
