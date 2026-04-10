@@ -137,7 +137,7 @@ With explicit coverage target and depth:
 ./target/release/inspector evaluate \
   --contig assembly.fasta \
   --read reads.fastq.gz \
-  --datatype nanopore \
+  --datatype nanopore_1041 \
   --outpath ./inspector-out/ \
   --thread 24 \
   --read-coverage 30 \
@@ -191,9 +191,9 @@ Skip selected steps:
 
 | Flag | Short | Type | Default | Description |
 |------|-------|------|---------|-------------|
-| `--contig` | `-c` | FILE (1+) | *(required)* | Assembly contigs in FASTA format. Accepts 1 or 2 files (haploid/diploid). |
+| `--contig` | `-c` | FILE (1+) | *(required)* | Assembly contigs in FASTA format. |
 | `--read` | `-r` | FILE (1+) | *(required)* | Sequencing reads in FASTA/FASTQ format (can be gzipped). |
-| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore`. |
+| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
 | `--outpath` | `-o` | PATH | `./inspector-out/` | Output directory. |
 | `--reference` | | FILE | *(none)* | Optional reference genome in FASTA format. |
 | `--thread` | `-t` | INT | `8` | Number of threads. |
@@ -218,7 +218,7 @@ Skip selected steps:
 | `--read` | `-r` | FILE (1+) | *(required)* | Sequencing reads in FASTA/FASTQ format. |
 | `--assembly` | `-a` | FILE | *(required)* | Assembly contigs in FASTA format (typically `valid_contig.fa` from evaluate output). |
 | `--outpath` | `-o` | PATH | `./inspector-correct-out/` | Output directory for corrected assembly. |
-| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore`. |
+| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
 | `--thread` | `-t` | INT | `8` | Number of threads. |
 | `--flye-timeout` | | INT | `3600` | Timeout in seconds for each Flye local-reassembly call. |
 | `--min-correction-support` | | INT | `1` | Minimum supporting read count in BED file required to apply a correction. |
@@ -259,9 +259,10 @@ Runs `evaluate` followed by `correct` in sequence. Evaluate output goes to `<out
 ## Datatype values
 
 Supported `--datatype` values:
-- `clr`
-- `hifi`
-- `nanopore`
+- `clr` - PacBio CLR (Continuous Long Reads)
+- `hifi` - PacBio HiFi (High Fidelity) reads
+- `nanopore_94` - Oxford Nanopore reads (chemistry 9.4 or older, noisier reads) → uses `map-ont` preset
+- `nanopore_1041` - Oxford Nanopore reads (chemistry 10.4.1 or newer, higher accuracy) → uses `lr:hq` preset
 
 
 ## Clustering algorithm
@@ -369,6 +370,5 @@ Each SV must pass **all** of these criteria:
 - **Lower coverage input** → lower thresholds → more permissive filtering → more calls but potentially more false positives
 
 The algorithm balances sensitivity and specificity by using these coverage-based thresholds to ensure structural variant calls are made only in regions with appropriate and stable read depth characteristics.
-```
 
 

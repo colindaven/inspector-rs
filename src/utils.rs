@@ -228,8 +228,8 @@ pub fn normalize_path(path: &str) -> String {
 /// Validate read datatype
 pub fn validate_datatype(datatype: &str) -> Result<()> {
     match datatype {
-        "clr" | "hifi" | "nanopore" => Ok(()),
-        _ => anyhow::bail!("Invalid datatype. Must be one of: clr, hifi, nanopore. Got: {}", datatype),
+        "clr" | "hifi" | "nanopore_94" | "nanopore_1041" => Ok(()),
+        _ => anyhow::bail!("Invalid datatype. Must be one of: clr, hifi, nanopore_94, nanopore_1041. Got: {}", datatype),
     }
 }
 
@@ -237,7 +237,8 @@ pub fn validate_datatype(datatype: &str) -> Result<()> {
 pub fn get_minimap2_preset(datatype: &str) -> &'static str {
     match datatype {
         "hifi" => "map-hifi",
-        "nanopore" => "map-ont",
+        "nanopore_94" => "map-ont",      // Use older map-ont for better SV detection on older noisy long reads, as recommended by minimap2 author
+        "nanopore_1041" => "lr:hq",      // Use "lr:hq" not older map-ont for better SV detection on less noisy long reads, as recommended by minimap2 author
         "clr" | _ => "map-pb",
     }
 }
@@ -562,14 +563,16 @@ mod tests {
     fn test_validate_datatype() {
         assert!(validate_datatype("clr").is_ok());
         assert!(validate_datatype("hifi").is_ok());
-        assert!(validate_datatype("nanopore").is_ok());
+        assert!(validate_datatype("nanopore_94").is_ok());
+        assert!(validate_datatype("nanopore_1041").is_ok());
         assert!(validate_datatype("invalid").is_err());
     }
 
     #[test]
     fn test_get_minimap2_preset() {
         assert_eq!(get_minimap2_preset("hifi"), "map-hifi");
-        assert_eq!(get_minimap2_preset("nanopore"), "map-ont");
+        assert_eq!(get_minimap2_preset("nanopore_94"), "map-ont");
+        assert_eq!(get_minimap2_preset("nanopore_1041"), "lr:hq");
         assert_eq!(get_minimap2_preset("clr"), "map-pb");
     }
 

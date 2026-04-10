@@ -278,7 +278,11 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
         }
     };
 
-    let rat = if datatype == "hifi" { 0.8 } else { 0.7 };
+    let rat = match datatype {
+        "hifi" => 0.8,
+        "nanopore_94" | "nanopore_1041" | "clr" => 0.7,
+        _ => 0.7, // default for other datatypes
+    };
     let highcov = (coverage * 2) as i64;
     let lowcov = (coverage / 2) as i64;
 
@@ -446,7 +450,7 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
 
     let structural_path = format!("{}structural_error.bed", outpath);
     let mut out = File::create(&structural_path)?;
-    writeln!(out, "#Contig_Name\tStart_Position\tEnd_Position\tSupporting_Read\tType\tSize\tHaplotype_Info\tDepth_Left\tDepth_Right\tDepth_Min\tSupporting_Read_Name\tHaplotype_Switch_Info")?;
+    writeln!(out, "#Contig_Name\tStart_Position\tEnd_Position\tSupporting_Read\tType\tSize\tHaplotype_Info\tDepth_Left\tDepth_Right\tDepth_Min\tSupporting_Read_name\tHaplotype_Switch_Info")?;
     for line in &filtered { writeln!(out, "{}", line)?; }
 
     let exp_n = filtered.iter().filter(|l| l.contains("Exp")).count();
@@ -528,7 +532,7 @@ pub fn write_structural_error_tsv(outpath: &str, base_name: &str) -> Result<()> 
     };
     let tsv_path = format!("{}{}-structural-error-inspector.tsv", outpath, base_name);
     let mut tsv = File::create(&tsv_path)?;
-    writeln!(tsv, "#Contig_Name\tStart_Position\tEnd_Position\tSupporting_Read\tType\tSize\tHaplotype_Info\tDepth_Left\tDepth_Right\tDepth_Min\tSupporting_Read_Name\tHaplotype_Switch_Info")?;
+    writeln!(tsv, "#Contig_Name\tStart_Position\tEnd_Position\tSupporting_Read\tType\tSize\tHaplotype_Info\tDepth_Left\tDepth_Right\tDepth_Min\tSupporting_Read_name\tHaplotype_Switch_Info")?;
     for sv in &lines { writeln!(tsv, "{}", sv)?; }
     info!("Wrote {} records to {}", lines.len(), tsv_path);
     Ok(())

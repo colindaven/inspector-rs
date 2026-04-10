@@ -56,7 +56,7 @@ impl SamRecord {
 pub fn get_mapq_threshold(datatype: &str) -> u8 {
     match datatype {
         "hifi" => 10,
-        "nanopore" => 5,
+        "nanopore_94" | "nanopore_1041" => 5,
         _ => 0, // clr or others
     }
 }
@@ -65,7 +65,7 @@ pub fn get_mapq_threshold(datatype: &str) -> u8 {
 pub fn get_min_identity(datatype: &str) -> f64 {
     match datatype {
         "hifi" => 0.99,
-        "nanopore" => 0.85,
+        "nanopore_94" | "nanopore_1041" => 0.85,
         _ => 0.80, // clr or others
     }
 }
@@ -130,7 +130,8 @@ mod tests {
     #[test]
     fn test_mapq_threshold() {
         assert_eq!(get_mapq_threshold("hifi"), 10);
-        assert_eq!(get_mapq_threshold("nanopore"), 5);
+        assert_eq!(get_mapq_threshold("nanopore_94"), 5);
+        assert_eq!(get_mapq_threshold("nanopore_1041"), 5);
         assert_eq!(get_mapq_threshold("clr"), 0);
     }
 }
