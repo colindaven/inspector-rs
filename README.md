@@ -1,6 +1,7 @@
 # Inspector-rs (Rust rewrite)
 
-Inspector-rs is a reference-free long-read assembly evaluator and error-correction tool. 
+Inspector-rs is a rewrite of the reference-free long-read assembly evaluator and error-correction tool Inspector by Maggie Chen and others. 
+Link: https://github.com/Maggi-Chen/Inspector (MIT license)
 
 It provides:
 - Assembly evaluation from long-read mappings
@@ -12,6 +13,7 @@ It provides:
 ## Motivation for rewrite
 - Mapping can be very slow for large genomes - so this is sped up by dividing read sets into 4 parts
 - Some python methods were unreliable or not robust for large read sets or genomes
+- The original Inspector requires Python 2.7 and a very old minimap2, which are now way out of data and not allowed in our environment.
 
 ## Current Status
 
@@ -19,16 +21,18 @@ It provides:
 - Plotting functions are currently placeholders and not functional.
 
 # Limitations
+* This is not a 1:1 rewrite of Inspector, but should be very similar. We did not agree with some design choices in Inspector (eg allowing a base error to be predicted by just one read in a low coverage 5x dataset) so made some changes.
+* Some parts may still be buggy - we are testing widely and welcome feedback.
 * Plots are non-functional
 * Collapses are found more rarely than the python implementation - may be buggy
-* Evaluation works, but the correction mode is not of interest to me, is untested and may not work.
+* Evaluation should work, but the assembly correction mode is not of interest to me, is untested and may not work.
 
 ## Dependencies
 
-## Download a release
+## Download a release (make sure you get the most current one!)
 
 ```bash
-wget https://github.com/colindaven/inspector-rs/releases/download/v0.0.1/inspector-rs
+wget https://github.com/colindaven/inspector-rs/releases/download/v0.0.4/inspector-rs
 chmod a+x inspector-rs
 # optional, or add to path in your .bashrc etc
 sudo cp inspector-rs /usr/local/bin
@@ -371,3 +375,8 @@ Each SV must pass **all** of these criteria:
 The algorithm balances sensitivity and specificity by using these coverage-based thresholds to ensure structural variant calls are made only in regions with appropriate and stable read depth characteristics.
 
 
+# Credits
+
+Inspector-rs is a rewrite of the reference-free long-read assembly evaluator and error-correction tool Inspector by Maggie Chen and others - so thanks to the original authors for a nice approach!
+
+Link: https://github.com/Maggi-Chen/Inspector (MIT license)
