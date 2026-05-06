@@ -150,7 +150,7 @@ Skip selected steps:
 ./target/release/inspector evaluate \
   --contig assembly.fasta \
   --read reads.fastq.gz \
-  --datatype clr \
+  --datatype nanopore_1041 \
   --outpath ./inspector-out/ \
   --skip-read-mapping \
   --skip-structural-error \
@@ -193,7 +193,7 @@ Skip selected steps:
 |------|-------|------|---------|-------------|
 | `--contig` | `-c` | FILE (1+) | *(required)* | Assembly contigs in FASTA format. |
 | `--read` | `-r` | FILE (1+) | *(required)* | Sequencing reads in FASTA/FASTQ format (can be gzipped). |
-| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
+| `--datatype` | `-d` | TYPE | `nanopore_1041` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
 | `--outpath` | `-o` | PATH | `./inspector-out/` | Output directory. |
 | `--reference` | | FILE | *(none)* | Optional reference genome in FASTA format. |
 | `--thread` | `-t` | INT | `8` | Number of threads. |
@@ -218,7 +218,7 @@ Skip selected steps:
 | `--read` | `-r` | FILE (1+) | *(required)* | Sequencing reads in FASTA/FASTQ format. |
 | `--assembly` | `-a` | FILE | *(required)* | Assembly contigs in FASTA format (typically `valid_contig.fa` from evaluate output). |
 | `--outpath` | `-o` | PATH | `./inspector-correct-out/` | Output directory for corrected assembly. |
-| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
+| `--datatype` | `-d` | TYPE | `nanopore_1041` | Input read type. Accepted values: `clr`, `hifi`, `nanopore_94`, `nanopore_1041`. |
 | `--thread` | `-t` | INT | `8` | Number of threads. |
 | `--flye-timeout` | | INT | `3600` | Timeout in seconds for each Flye local-reassembly call. |
 | `--min-correction-support` | | INT | `1` | Minimum supporting read count in BED file required to apply a correction. |
@@ -231,7 +231,7 @@ Runs `evaluate` followed by `correct` in sequence. Evaluate output goes to `<out
 |------|-------|------|---------|-------------|
 | `--contig` | `-c` | FILE (1+) | *(required)* | Assembly contigs in FASTA format. |
 | `--read` | `-r` | FILE (1+) | *(required)* | Sequencing reads in FASTA/FASTQ format (can be gzipped). |
-| `--datatype` | `-d` | TYPE | `clr` | Input read type. Accepted values: `clr`, `hifi`, `nanopore`. |
+| `--datatype` | `-d` | TYPE | `nanopore_1041` | Input read type. Accepted values: `clr`, `hifi`, `nanopore`. |
 | `--outpath` | `-o` | PATH | `./inspector-out/` | Root output directory. |
 | `--reference` | | FILE | *(none)* | Optional reference genome in FASTA format. |
 | `--thread` | `-t` | INT | `8` | Number of threads. |
@@ -259,11 +259,10 @@ Runs `evaluate` followed by `correct` in sequence. Evaluate output goes to `<out
 ## Datatype values
 
 Supported `--datatype` values:
-- `clr` - PacBio CLR (Continuous Long Reads)
-- `hifi` - PacBio HiFi (High Fidelity) reads
-- `nanopore_94` - Oxford Nanopore reads (chemistry 9.4 or older, noisier reads) → uses `map-ont` preset
 - `nanopore_1041` - Oxford Nanopore reads (chemistry 10.4.1 or newer, higher accuracy) → uses `lr:hq` preset
-
+- `nanopore_94` - Oxford Nanopore reads (chemistry 9.4 or older, noisier reads) → uses `map-ont` preset
+- `hifi` - PacBio HiFi (High Fidelity) reads
+- `clr` - PacBio CLR (Continuous Long Reads)
 
 ## Clustering algorithm
 
