@@ -6,6 +6,27 @@ use log::{info, warn};
 use rayon::prelude::*;
 use crate::{static_analysis, detect, merge, base_error, plot, utils};
 
+fn contig_coverage_for_base_error(outpath: &str, chrom: &str, contig_length: u64, fallback: usize) -> usize {
+    if contig_length == 0 {
+        return fallback.max(1);
+    }
+
+    let depth_file = format!("{}map_depth/read_to_contig_{}.depth", outpath, chrom);
+    if let Ok(contents) = std::fs::read_to_string(&depth_file) {
+        if let Some(line) = contents.lines().next() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            if fields.len() >= 3 {
+                if let Ok(total_mapped_bp) = fields[2].parse::<u64>() {
+                    let coverage = (total_mapped_bp / contig_length) as usize;
+                    return coverage.max(1);
+                }
+            }
+        }
+    }
+
+    fallback.max(1)
+}
+
 #[derive(Debug, Clone)]
 pub struct EvaluateConfig {
     pub contig: Vec<String>,
@@ -20,6 +41,7 @@ pub struct EvaluateConfig {
     pub min_contig_length_assemblyerror: usize,
     pub min_assembly_error_size: usize,
     pub max_assembly_error_size: usize,
+    pub min_mapping_quality: u8,
     pub noplot: bool,
     pub skip_read_mapping: bool,
     pub skip_structural_error: bool,
@@ -125,7 +147,7 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
     info!("TIME: Structural error signal detection: {}", (t3 - t2).as_secs_f64());
 
     // Phase 5: SV clustering and filtering
-    let ae_len_structural_error;
+    let structural_error_stats;
     if !config.skip_structural_error {
         std::fs::create_dir_all(format!("{}ae_merge_workspace", outpath))?;
         
@@ -142,9 +164,9 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
         
         static_analysis::assembly_info_cluster(&outpath, config.min_assembly_error_size, config.max_assembly_error_size)?;
         merge::genotype(coverage, &outpath)?;
-        ae_len_structural_error = merge::filter_errors(coverage, &outpath, config.min_assembly_error_size, &config.datatype)?;
+        structural_error_stats = merge::filter_errors(coverage, &outpath, config.min_assembly_error_size, &config.datatype)?;
     } else {
-        ae_len_structural_error = 0;
+        structural_error_stats = merge::FilterErrorStats::default();
     }
 
     let t4 = std::time::Instant::now();
@@ -162,13 +184,21 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
             // Parallel pileup SNV detection per contig (each writes to separate baseerror_{chrom}.bed)
             let all_chroms: Vec<_> = fasta_stats.chromosomes_map.keys().collect();
             all_chroms.par_iter()
-                .map(|chrom| base_error::get_snv(
-                    &outpath,
-                    chrom,
-                    (coverage * 2) / 5,
-                    coverage * 2,
-                    config.min_depth,
-                ))
+                .map(|chrom| {
+                    let contig_length = fasta_stats.contig_lengths.get(*chrom).copied().unwrap_or(0);
+                    let contig_coverage = contig_coverage_for_base_error(&outpath, chrom, contig_length, coverage);
+                    let mincount = ((contig_coverage * 2) / 5).max(2);
+                    let maxcov = (contig_coverage * 2).max(2);
+                    base_error::get_snv(
+                        &outpath,
+                        chrom,
+                        contig_length,
+                        mincount,
+                        maxcov,
+                        config.min_depth,
+                        config.min_mapping_quality,
+                    )
+                })
                 .collect::<Result<Vec<_>>>()?;
         }
         
@@ -190,7 +220,7 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
 
     // Compute long_read_QV — always, regardless of error count
     {
-        let total_errors = ae_len_structural_error + ae_len_base_error;
+        let total_errors = structural_error_stats.total_bases + ae_len_base_error;
         let valid_bases = fasta_stats.total_length;
 
         let long_read_qv = if total_errors == 0 || valid_bases == 0 {
@@ -209,14 +239,16 @@ pub fn run(config: EvaluateConfig) -> Result<()> {
         merge::write_structural_error_tsv(&outpath, assembly_name)?;
         
         // Write extended summary statistics
-        merge::write_summary_statistics_extended(&outpath, &fasta_stats, coverage, ae_len_structural_error, &base_error_counts)?;
+        merge::write_summary_statistics_extended(&outpath, &fasta_stats, coverage, structural_error_stats.total_bases, &base_error_counts)?;
 
         // Log long_read_QV prominently
         if long_read_qv.is_infinite() {
-            info!("Assembly error size: {} (structural: {}, base: {})", total_errors, ae_len_structural_error, ae_len_base_error);
+            info!("Assembly error size: {} (structural bases: {}, structural events: {}, base: {})",
+                total_errors, structural_error_stats.total_bases, structural_error_stats.count, ae_len_base_error);
             info!("long_read_QV: Inf (no errors detected)");
         } else {
-            info!("Assembly error size: {} (structural: {}, base: {})", total_errors, ae_len_structural_error, ae_len_base_error);
+            info!("Assembly error size: {} (structural bases: {}, structural events: {}, base: {})",
+                total_errors, structural_error_stats.total_bases, structural_error_stats.count, ae_len_base_error);
             info!("long_read_QV: {:.2}", long_read_qv);
         }
     }
@@ -305,7 +337,13 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64) -> Res
 
     let keep_fraction: Option<f64> = if genome_size_bp > 0 && total_input_bases > 0 {
         let estimated_coverage = total_input_bases as f64 / genome_size_bp as f64;
-        if config.read_coverage > 0 && estimated_coverage > config.read_coverage as f64 {
+        if config.read_coverage == 0 {
+            info!(
+                "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling disabled (--read-coverage=0)",
+                estimated_coverage, total_input_reads, total_input_bases,
+            );
+            None
+        } else if estimated_coverage > config.read_coverage as f64 {
             let fraction = config.read_coverage as f64 / estimated_coverage;
             info!(
                 "Estimated read coverage: {:.2}x across {} reads, {} bp; subsampling to target {}x (keep fraction {:.4})",
@@ -382,12 +420,6 @@ fn map_reads(config: &EvaluateConfig, outpath: &str, genome_size_bp: u64) -> Res
                 let bam_out = format!("{}part_{:02}.bam", split_dir, part_idx);
 
                 // Run minimap2 | samtools sort — piped so no intermediate SAM file touches disk.
-                // -x preset: critical for accuracy and speed (map-hifi / map-ont / map-pb)
-                // -a: SAM output (piped to samtools)
-                // -Q: don't output base qualities in SAM (not needed downstream, saves I/O)
-                // -N 1: keep at most 1 secondary alignment
-                // --secondary=no: cleaner — omit secondary alignments entirely (flag 256)
-                // -I 10G: index batch size; prevents re-indexing on large genomes
                 let minimap = std::process::Command::new("minimap2")
                     .arg("-a")
                     .arg("-x").arg(preset)

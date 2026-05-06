@@ -85,7 +85,8 @@ pub fn parse_cigar_ref(
                 } else {
                     right_clip = op.count;
                 }
-                query_pos += op.count;
+                // Do NOT add to query_pos: query_length should equal the aligned
+                // portion only (M+I+X), matching Python's query_alignment_length.
             }
             'H' => {
                 // Hard clip - doesn't consume query
@@ -109,8 +110,9 @@ pub fn parse_cigar_ref(
     }
 }
 
-/// Parse CIGAR from split-read alignment
-/// Similar to ref parsing but tracks both directions
+/// Parse CIGAR from split-read alignment.
+/// Matches Python's `cigardeletion()`: captures indels >= 5bp, merges nearby
+/// ones within the read, then retains only those >= min_size.
 pub fn parse_cigar(
     _flag: u16,
     _chrom: &str,
@@ -119,47 +121,79 @@ pub fn parse_cigar(
     min_size: usize,
     max_size: usize,
 ) -> CigarInfo {
-    parse_cigar_ref(_flag, _chrom, position, cigar, min_size, max_size)
+    // Step 1: parse with capture_min=5 to get small indels that may merge
+    let capture_min = 5usize;
+    let mut info = parse_cigar_ref(_flag, _chrom, position, cigar, capture_min, max_size);
+    // Step 2: merge nearby indels within the read (Python's cigardeletion merge logic)
+    merge_indels(&mut info.insertions, &mut info.deletions);
+    // Step 3: filter to actual min_size
+    info.insertions.retain(|&(_, len)| len >= min_size as u64);
+    info.deletions.retain(|&(_, len)| len >= min_size as u64);
+    info
 }
 
-/// Merge nearby indels within a window
-/// Used to combine signals from overlapping CIGAR indels
+/// Merge nearby indels within a read, mirroring Python's `cigardeletion()`.
+///
+/// Deletion merge: fixed 500bp gap window.
+/// Insertion merge: adaptive window based on sizes of the pair being considered:
+///   - max(l1,l2) < 100  → 600bp
+///   - 100 ≤ max(l1,l2) < 500 → 400bp
+///   - max(l1,l2) ≥ 500  → 600bp
+///
+/// Iterates from the rightmost pair backwards until no more merges are possible
+/// (matching Python's single-pass-from-right with restart behaviour).
 pub fn merge_indels(insertions: &mut Vec<(u64, u64)>, deletions: &mut Vec<(u64, u64)>) {
-    // Merge insertions within window
-    let insertion_window = 200;
+    // Merge deletions within fixed 500bp gap window
     let mut merged = true;
     while merged {
         merged = false;
-        insertions.sort_by_key(|x| x.0);
-
-        for i in (1..insertions.len()).rev() {
-            if insertions[i].0 - insertions[i - 1].0 <= insertion_window {
-                let combined = (insertions[i - 1].0, insertions[i - 1].1 + insertions[i].1);
-                insertions.remove(i);
-                insertions.remove(i - 1);
-                insertions.push(combined);
+        if deletions.len() <= 1 { break; }
+        deletions.sort_by_key(|x| x.0);
+        let mut i = deletions.len() - 1;
+        while i > 0 {
+            let gap = deletions[i].0.saturating_sub(deletions[i - 1].0 + deletions[i - 1].1);
+            if gap <= 500 {
+                let combined = (deletions[i - 1].0, deletions[i - 1].1 + deletions[i].1);
+                deletions.remove(i);
+                deletions[i - 1] = combined;
                 merged = true;
                 break;
             }
+            i -= 1;
         }
     }
 
-    // Merge deletions within window
-    let deletion_window = 500;
+    // Merge insertions with adaptive window (matches Python exactly)
     merged = true;
     while merged {
         merged = false;
-        deletions.sort_by_key(|x| x.0);
-
-        for i in (1..deletions.len()).rev() {
-            if deletions[i].0 - deletions[i - 1].0 <= deletion_window {
-                let combined = (deletions[i - 1].0, deletions[i - 1].1 + deletions[i].1);
-                deletions.remove(i);
-                deletions.remove(i - 1);
-                deletions.push(combined);
+        if insertions.len() <= 1 { break; }
+        insertions.sort_by_key(|x| x.0);
+        let mut i = insertions.len() - 1;
+        while i > 0 {
+            let l1 = insertions[i].1;
+            let l2 = insertions[i - 1].1;
+            let max_len = l1.max(l2);
+            // Python logic:
+            //   window=200 if max(l1,l2)<100 else 400
+            //   window=400 if window==400 and max(l1,l2)<500 else 600
+            // Result: <100 → 600, 100..499 → 400, >=500 → 600
+            let window: u64 = if max_len < 100 {
+                600
+            } else if max_len < 500 {
+                400
+            } else {
+                600
+            };
+            let gap = insertions[i].0.saturating_sub(insertions[i - 1].0);
+            if gap <= window {
+                let combined = (insertions[i - 1].0, l1 + l2);
+                insertions.remove(i);
+                insertions[i - 1] = combined;
                 merged = true;
                 break;
             }
+            i -= 1;
         }
     }
 }
@@ -201,10 +235,10 @@ mod tests {
     #[test]
     fn test_parse_cigar_with_clipping() {
         let cigar = "10S50M10S";
-        let info = parse_cigar(0, "chr1", 1000, cigar, 50, 4000000);
+        let info = parse_cigar(0, "chr1", 1000, cigar, 5, 4000000);
         assert_eq!(info.left_clip, 10);
         assert_eq!(info.right_clip, 10);
-        assert_eq!(info.query_length, 70); // 10 + 50 + 10
+        assert_eq!(info.query_length, 50); // aligned portion only (M), clips excluded
     }
 }
 

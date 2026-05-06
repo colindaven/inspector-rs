@@ -59,13 +59,23 @@ pub fn detect_segments(
                 let left = &segs[i];
                 let right = &segs[j];
 
-                // Same chromosome - insertions/deletions
-                if left.rname == right.rname {
-                    detect_insertion_deletion(left, right, min_size, max_size, &mut sv_calls);
-                    detect_inversion(left, right, min_size, max_size, &mut sv_calls);
+                // Same chromosome only
+                if left.rname != right.rname {
+                    continue;
+                }
+
+                let left_rev = (left.flag & 16) != 0;
+                let right_rev = (right.flag & 16) != 0;
+
+                if left_rev == right_rev {
+                    // Same direction → insertions/deletions
+                    // Python also requires: right.refend - left.refend > -200
+                    if (right.refend as i64 - left.refend as i64) > -200 {
+                        detect_insertion_deletion(left, right, min_size, max_size, &mut sv_calls);
+                    }
                 } else {
-                    // Different chromosomes - translocation
-                    detect_translocation(left, right, &mut sv_calls);
+                    // Opposite direction → inversions
+                    detect_inversion(left, right, min_size, max_size, &mut sv_calls);
                 }
             }
         }
@@ -74,7 +84,19 @@ pub fn detect_segments(
     sv_calls
 }
 
-/// Detect insertions and deletions
+/// Detect insertions and deletions from same-direction split-read pairs.
+/// Mirrors Python's `segmentdeletion` for `samedirchr` pairs.
+///
+/// Insertion formula (Python):
+///   window = 300; if abs(right.pos - left.refend) <= window:
+///     overlap = right.pos - left.refend
+///     ins_size = right.leftclip - left.aligned - left.leftclip - overlap
+///   Which simplifies to: ins_size = query_gap - ref_gap
+///
+/// Deletion formula (Python):
+///   overlapmap = left.leftclip + left.aligned - right.leftclip  (= -query_gap)
+///   if -200 < overlapmap < 2000:
+///     del_size = (right.pos - left.refend) + overlapmap = ref_gap - query_gap
 fn detect_insertion_deletion(
     left: &ReadSegment,
     right: &ReadSegment,
@@ -82,50 +104,50 @@ fn detect_insertion_deletion(
     max_size: usize,
     sv_calls: &mut Vec<String>,
 ) {
-    let window_max = 500;
-    let overlap_window = -200i64;
-
-    // Calculate reference and query gaps between segments
+    // ref_gap = right.pos - left.refend (Python's "overlap" or basis for it)
     let ref_gap = right.pos as i64 - left.refend as i64;
-    
-    // Query gap: distance in query between end of left segment and start of right segment
-    // If segments are consecutive on the query, query_gap ≈ 0
-    // If there's a gap, query_gap > 0; if overlap, query_gap < 0
+
+    // query_gap = right.leftclip - (left.leftclip + left.aligned)
     let left_query_end = left.cigar_info.0 as i64 + left.cigar_info.1 as i64;
     let right_query_start = right.cigar_info.0 as i64;
     let query_gap = right_query_start - left_query_end;
 
-    // Insertion: reference gap is small but query extends beyond
-    // This means query bases align to the same ref position (insertion in assembly)
-    if ref_gap > overlap_window && ref_gap < window_max as i64 && query_gap > 100 {
-        let insert_size = query_gap;
+    // --- Insertion detection ---
+    // Python: if abs(rightread[3]-leftread[4]) <= 300 (window=300)
+    let ins_window: i64 = 300;
+    if ref_gap.abs() <= ins_window {
+        let insert_size = query_gap - ref_gap; // Python: rightinfo[0]-leftinfo[1]-leftinfo[0]-overlap
         if insert_size >= min_size as i64 && insert_size <= max_size as i64 {
-            // 7-field format: chrom pos size type readname flag_sum avg_mapq
-            let sv_line = format!(
-                "{}	{}	{}	I-segment	{}	{}	{}",
-                left.rname, left.refend, insert_size,
+            let pos = std::cmp::min(right.pos, left.refend);
+            sv_calls.push(format!(
+                "{}\t{}\t{}\tI-segment\t{}\t{}\t{}",
+                left.rname, pos, insert_size,
                 left.query_name,
                 left.flag as u32 + right.flag as u32,
                 (left.mapq as u32 + right.mapq as u32) / 2
-            );
-            sv_calls.push(sv_line);
+            ));
             return;
         }
     }
 
-    // Deletion: reference gap is large compared to query gap
-    // This means assembly is missing bases that are in the reads
-    if ref_gap > 100 {
-        let delete_size = ref_gap - query_gap;
+    // --- Deletion detection ---
+    // Python: overlapmap = leftinfo[0]+leftinfo[1]-rightinfo[0] = -query_gap
+    //         if -200 < overlapmap < 2000:
+    //           del_size = rightread[3]-leftread[4]+overlapmap = ref_gap + (-query_gap) = ref_gap - query_gap
+    let overlapmap = -query_gap;
+    let del_overlap_window: i64 = -200;
+    let del_window_max: i64 = 2000;
+    if overlapmap > del_overlap_window && overlapmap < del_window_max {
+        let delete_size = ref_gap + overlapmap; // = ref_gap - query_gap
         if delete_size >= min_size as i64 && delete_size <= max_size as i64 {
-            let sv_line = format!(
-                "{}	{}	{}	D-segment	{}	{}	{}",
-                left.rname, left.refend, delete_size,
+            let pos = left.refend as i64 - std::cmp::max(0, overlapmap);
+            sv_calls.push(format!(
+                "{}\t{}\t{}\tD-segment\t{}\t{}\t{}",
+                left.rname, pos.max(0), delete_size,
                 left.query_name,
                 left.flag as u32 + right.flag as u32,
                 (left.mapq as u32 + right.mapq as u32) / 2
-            );
-            sv_calls.push(sv_line);
+            ));
         }
     }
 }

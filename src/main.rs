@@ -23,7 +23,7 @@ enum Commands {
         read: Vec<String>,
 
         /// Input read type
-        #[arg(short, long, value_name = "TYPE", default_value = "clr")]
+        #[arg(short, long, value_name = "TYPE", default_value = "nanopore_1041")]
         datatype: String,
 
         /// Output directory
@@ -38,14 +38,19 @@ enum Commands {
         #[arg(short, long, default_value = "8")]
         thread: usize,
 
-        /// Target read coverage for pre-mapping subsampling; reads above this estimated coverage are downsampled
-        #[arg(long, default_value = "30")]
+        /// Target read coverage for pre-mapping subsampling; reads above this estimated coverage are downsampled.
+        /// Set to 0 to disable subsampling (default: disabled for performance)
+        #[arg(long, default_value = "0")]
         read_coverage: usize,
 
         /// Minimal read-alignment depth for a base to be considered in QV calculation.
         /// If not specified, defaults to 20% of average depth
         #[arg(long, value_name = "INT")]
         min_depth: Option<usize>,
+
+        /// Minimal read mapping quality used for small-scale base-error detection
+        #[arg(long, value_name = "INT", default_value = "20")]
+        min_mapping_quality: u8,
 
         /// Minimal length for a contig to be evaluated
         #[arg(long, default_value = "10000")]
@@ -107,7 +112,7 @@ enum Commands {
         outpath: String,
 
         /// Input read type
-        #[arg(short, long, value_name = "TYPE", default_value = "clr")]
+        #[arg(short, long, value_name = "TYPE", default_value = "nanopore_1041")]
         datatype: String,
 
         /// Number of threads
@@ -134,7 +139,7 @@ enum Commands {
         read: Vec<String>,
 
         /// Input read type
-        #[arg(short, long, value_name = "TYPE", default_value = "clr")]
+        #[arg(short, long, value_name = "TYPE", default_value = "nanopore_1041")]
         datatype: String,
 
         /// Output directory (evaluation output will be in <outpath>/evaluate/,
@@ -150,13 +155,18 @@ enum Commands {
         #[arg(short, long, default_value = "8")]
         thread: usize,
 
-        /// Target read coverage for pre-mapping subsampling; reads above this estimated coverage are downsampled
-        #[arg(long, default_value = "30")]
+        /// Target read coverage for pre-mapping subsampling; reads above this estimated coverage are downsampled.
+        /// Set to 0 to disable subsampling (default: disabled for performance)
+        #[arg(long, default_value = "0")]
         read_coverage: usize,
 
         /// Minimal read-alignment depth for a base to be considered in QV calculation
         #[arg(long, value_name = "INT")]
         min_depth: Option<usize>,
+
+        /// Minimal read mapping quality used for small-scale base-error detection
+        #[arg(long, value_name = "INT", default_value = "20")]
+        min_mapping_quality: u8,
 
         /// Minimal length for a contig to be evaluated
         #[arg(long, default_value = "10000")]
@@ -213,6 +223,7 @@ fn main() -> Result<()> {
             thread,
             read_coverage,
             min_depth,
+            min_mapping_quality,
             min_contig_length,
             min_contig_length_assemblyerror,
             min_assembly_error_size,
@@ -247,6 +258,7 @@ fn main() -> Result<()> {
                 thread,
                 read_coverage,
                 min_depth,
+                min_mapping_quality,
                 min_contig_length,
                 min_contig_length_assemblyerror,
                 min_assembly_error_size,
@@ -301,6 +313,7 @@ fn main() -> Result<()> {
             thread,
             read_coverage,
             min_depth,
+            min_mapping_quality,
             min_contig_length,
             min_contig_length_assemblyerror,
             min_assembly_error_size,
@@ -340,6 +353,7 @@ fn main() -> Result<()> {
                 thread,
                 read_coverage,
                 min_depth,
+                min_mapping_quality,
                 min_contig_length,
                 min_contig_length_assemblyerror,
                 min_assembly_error_size,

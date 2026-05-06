@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Write};
 use anyhow::Result;
 use log::info;
-use crate::merge::merge_ops::{merge_with_bimodal, counttime_cluster};
+use crate::merge::merge_ops::merge_with_bimodal;
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -38,11 +38,36 @@ fn sig_type(line: &str) -> &str {
     line.split('\t').nth(3).unwrap_or("")
 }
 
-/// Adaptive-window grouping for large SVs (>2000 bp).
-/// Delegates to `counttime_cluster` which replicates Python's `counttime_insertion` /
-/// `counttime_deletion` adaptive window (100 → 200/400/800 bp by mean cluster size).
-fn cluster_large_svs(signals: &[String], min_support: usize, _window: u64) -> Vec<String> {
-    counttime_cluster(signals, min_support)
+/// Fixed-window grouping for large SVs (>2000 bp).
+/// Matches Python's cluster / cluster_ins: sort by (pos, size), group within a
+/// fixed 1600bp window, then merge each group via `merge_with_bimodal`.
+fn cluster_large_svs(signals: &[String], min_support: usize, window: u64) -> Vec<String> {
+    if signals.is_empty() {
+        return Vec::new();
+    }
+    let mut sorted = signals.to_vec();
+    sorted.sort_by_key(|l| (sig_pos(l), sig_size(l)));
+
+    let mut results: Vec<String> = Vec::new();
+    let mut candi: Vec<String> = vec![sorted[0].clone()];
+    let mut start = sig_pos(&sorted[0]);
+
+    for event in sorted.into_iter().skip(1) {
+        let ev_pos = sig_pos(&event);
+        if ev_pos <= start + window {
+            candi.push(event);
+        } else {
+            if candi.len() >= min_support {
+                results.extend(merge_with_bimodal(&candi, min_support));
+            }
+            candi = vec![event];
+            start = ev_pos;
+        }
+    }
+    if candi.len() >= min_support {
+        results.extend(merge_with_bimodal(&candi, min_support));
+    }
+    results
 }
 
 /// Depth-map spatial clustering for small SVs (<=3000bp).
@@ -135,11 +160,11 @@ pub fn cluster(
     info!("Clustering deletions for {}", chrom);
     let all_sv = read_debreak_temp(outpath, chrom)?;
 
-    let large_del: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with("D-") && sig_size(l) > 2000).cloned().collect();
+    let large_del: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with("D-") && sig_size(l) > 3000).cloned().collect();
     let large_merged = cluster_large_svs(&large_del, min_support, 1600);
 
     let small_del: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with("D-") && sig_size(l) <= 3000).cloned().collect();
-    info!("  del {}: {} total signals, {} large (>2000), {} small (<=3000)",
+    info!("  del {}: {} total signals, {} large (>3000), {} small (<=3000)",
           chrom, all_sv.len(), large_del.len(), small_del.len());
     let small_annotated = cluster_small_svs_depth_map(&small_del, contig_length, max_depth, min_support,
         |pos, size| { let s = (pos as usize).saturating_sub(1); let e = (pos + size) as usize; (s, e) },
@@ -173,11 +198,11 @@ pub fn cluster_insertions(
     info!("Clustering {}s for {}", type_label, chrom);
     let all_sv = read_debreak_temp(outpath, chrom)?;
 
-    let large_sv: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with(signal_marker) && sig_size(l) > 2000).cloned().collect();
+    let large_sv: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with(signal_marker) && sig_size(l) > 3000).cloned().collect();
     let large_merged = cluster_large_svs(&large_sv, min_support, 1600);
 
     let small_sv: Vec<String> = all_sv.iter().filter(|l| sig_type(l).starts_with(signal_marker) && sig_size(l) <= 3000).cloned().collect();
-    info!("  {} {}: {} total signals, {} large (>2000), {} small (<=3000)",
+    info!("  {} {}: {} total signals, {} large (>3000), {} small (<=3000)",
           type_label, chrom, all_sv.len(), large_sv.len(), small_sv.len());
     let small_annotated = cluster_small_svs_depth_map(&small_sv, contig_length, max_depth, min_support,
         |pos, _size| { let s = (pos as usize).saturating_sub(101); let e = pos as usize + 101; (s, e) },
@@ -212,7 +237,9 @@ fn count_reads_in_region(bam: &str, chrom: &str, start: u64, end: u64) -> u64 {
     }
     let region = format!("{}:{}-{}", chrom, start + 1, end);
     match std::process::Command::new("samtools")
-        .args(["view", "-c", bam, &region])
+        // Match pysam count() more closely by excluding unmapped, secondary,
+        // QC-failed, duplicate, and supplementary alignments.
+        .args(["view", "-c", "-F", "3844", bam, &region])
         .output()
     {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
@@ -241,16 +268,22 @@ pub fn genotype(coverage: usize, outpath: &str) -> Result<()> {
         let fields: Vec<&str> = line.split('\t').collect();
         if fields.len() < 4 { continue; }
         let chrom = fields[0];
+        // Skip HaplotypeSwitch entries (they have semicolon-separated positions that can't be parsed as i64).
+        // HaplotypeSwitch entries are already genotyped via their component expansion/collapse variants.
+        if line.contains("HaplotypeSwitch") {
+            writeln!(gt_out, "{}\t1/0\t0\t0\t0", line)?;
+            continue;
+        }
         let start: i64 = fields[1].parse().unwrap_or(0);
         let stop:  i64 = fields[2].parse().unwrap_or(0);
         let supporting: f64 = fields[3].parse().unwrap_or(0.0);
         if start < 0 { continue; }
         let left_cov  = count_reads_in_region(&bam, chrom, (start - 100).max(0) as u64, start as u64);
         let right_cov = count_reads_in_region(&bam, chrom, stop as u64, (stop + 100) as u64);
-        let min_cov = left_cov.min(right_cov);
-        let gt = if supporting >= 0.6 * min_cov as f64 { "1/1" } else { "1/0" };
+        let min_flank_depth = left_cov.min(right_cov);
+        let gt = if supporting >= 0.6 * min_flank_depth as f64 { "1/1" } else { "1/0" };
         // Match Python output columns: original fields + gt + left + right + min
-        writeln!(gt_out, "{}\t{}\t{}\t{}\t{}", line, gt, left_cov, right_cov, min_cov)?;
+        writeln!(gt_out, "{}\t{}\t{}\t{}\t{}", line, gt, left_cov, right_cov, min_flank_depth)?;
     }
     info!("Genotyping complete");
     Ok(())
@@ -262,7 +295,13 @@ pub fn genotype(coverage: usize, outpath: &str) -> Result<()> {
 
 /// Filter and reconcile expansion/collapse pairs.
 /// Mirrors Python filterae() in debreak_merge_clustering.py.
-pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: &str) -> Result<usize> {
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterErrorStats {
+    pub count: usize,
+    pub total_bases: usize,
+}
+
+pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: &str) -> Result<FilterErrorStats> {
     info!("Filtering errors (avg coverage: {})", coverage);
 
     let gt_path = format!("{}assembly_errors.bed-gt", outpath);
@@ -274,7 +313,7 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
             .collect(),
         Err(_) => {
             File::create(format!("{}structural_error.bed", outpath))?;
-            return Ok(0);
+            return Ok(FilterErrorStats::default());
         }
     };
 
@@ -366,10 +405,20 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
                         ));
                     }
                 } else {
+                    // For HaplotypeSwitch entries: use the maximum flanking depth from both variants.
+                    // This ensures the genotyped depth reflects the merged region better than using
+                    // just the expansion's depth values.
+                    let exp_left: i64 = c[8].parse().unwrap_or(0);
+                    let exp_right: i64 = c[9].parse().unwrap_or(0);
+                    let col_left: i64 = d[8].parse().unwrap_or(0);
+                    let col_right: i64 = d[9].parse().unwrap_or(0);
+                    let hap_left = exp_left.max(col_left);
+                    let hap_right = exp_right.max(col_right);
+                    let hap_min = hap_left.min(hap_right);
                     reconciled.push(format!(
                         "{}\t{};{}\t{};{}\t{}\tHaplotypeSwitch\tSize={};{}\t-/-\t{}\t{}\t{}\t{}:{}\t{};{}",
                         chrom, c[1], d[1], c[2], d[2], totaln, c_end - c_start, d_size,
-                        c[8], c[9], c[10], uniq_join(expreads), uniq_join(colreads), goodexp, goodcol
+                        hap_left, hap_right, hap_min, uniq_join(expreads), uniq_join(colreads), goodexp, goodcol
                     ));
                 }
             } else if ratio < 0.33 {
@@ -424,7 +473,11 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
         let f: Vec<&str> = line.split('\t').collect();
         if f.len() < 10 { continue; }
         let support: i64 = f[3].parse().unwrap_or(0);
-        let depth_min: i64 = f[9].parse().unwrap_or(0);
+        let min_flank_depth: i64 = f[9].parse().unwrap_or(0);
+        if line.contains("Haplo") {
+            info!("DEBUG HaplotypeSwitch: {} fields, [3]={}, [9]={}, support={}, min_flank_depth={}", 
+                  f.len(), f.get(3).unwrap_or(&"MISSING"), f.get(9).unwrap_or(&"MISSING"), support, min_flank_depth);
+        }
         let sizes = parse_size_field(f[5]);
         let max_size = sizes.into_iter().max().unwrap_or(0);
         if max_size < min_size as i64 {
@@ -432,15 +485,15 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
             continue;
         }
         let pass = support >= 10
-            && (support as f64) >= rat * depth_min as f64
-            && lowcov <= depth_min
-            && depth_min < highcov;
+            && (support as f64) >= rat * min_flank_depth as f64
+            && lowcov <= min_flank_depth
+            && min_flank_depth < highcov;
         if !pass {
-            info!("  SKIP {}/{} @ {}:{} support={} depth_min={} (need >={} and >={:.1} and cov [{},{}])",
+            info!("  SKIP {}/{} @ {}:{} support={} min_flank_depth={} (need support >={} and min_flank_depth >={:.1} and coverage range between [{},{}])",
                   f[4], f[5], f[0], f[1],
-                  support, depth_min,
+                  support, min_flank_depth,
                   10,
-                  rat * depth_min as f64,
+                  rat * min_flank_depth as f64,
                   lowcov, highcov);
         }
         if pass {
@@ -495,7 +548,10 @@ pub fn filter_errors(coverage: usize, outpath: &str, min_size: usize, datatype: 
     }
 
     info!("Total filtered errors: {}", filtered.len());
-    Ok(totalbase)
+    Ok(FilterErrorStats {
+        count: filtered.len(),
+        total_bases: totalbase,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -543,11 +599,11 @@ pub fn write_summary_statistics_extended(
     outpath: &str,
     fasta_stats: &crate::static_analysis::FastaStats,
     coverage: usize,
-    ae_len_structural_error: usize,
+    structural_error_bases: usize,
     base_error_counts: &crate::base_error::BaseErrorCounts,
 ) -> Result<()> {
     let ae_len_base_error = base_error_counts.total;
-    let total_errors = ae_len_structural_error + ae_len_base_error;
+    let total_errors = structural_error_bases + ae_len_base_error;
 
     // Use validbase from pileup if available (matches Python QV denominator),
     // otherwise fall back to total assembly length.
